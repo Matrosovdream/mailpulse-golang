@@ -1,0 +1,6 @@
+.idea
+.vscode
+*.exe
+bin/
+dist/
+config.local.json
