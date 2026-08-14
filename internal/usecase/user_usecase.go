@@ -2,6 +2,12 @@ package usecase
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"strings"
+	"time"
+
 	"mailpulse/internal/entity"
 	"mailpulse/internal/gateway/cache"
 	"mailpulse/internal/gateway/messaging"
@@ -18,54 +24,87 @@ import (
 )
 
 type UserUseCase struct {
-	DB             *gorm.DB
-	Log            *logrus.Logger
-	Validate       *validator.Validate
-	UserRepository *repository.UserRepository
-	UserProducer   *messaging.UserProducer
-	UserCache      *cache.UserCache
+	DB         *gorm.DB
+	Log        *logrus.Logger
+	Validate   *validator.Validate
+	Users      *repository.UserRepository
+	Roles      *repository.RoleRepository
+	Sessions   *repository.UserSessionRepository
+	Audit      *AuditUseCase
+	Producer   *messaging.UserProducer
+	UserCache  *cache.UserCache
+	ResetCache *cache.PasswordResetCache
+	SessionTTL time.Duration
 }
 
-func NewUserUseCase(db *gorm.DB, logger *logrus.Logger, validate *validator.Validate,
-	userRepository *repository.UserRepository, userProducer *messaging.UserProducer,
-	userCache *cache.UserCache) *UserUseCase {
+func NewUserUseCase(db *gorm.DB, log *logrus.Logger, validate *validator.Validate,
+	users *repository.UserRepository, roles *repository.RoleRepository,
+	sessions *repository.UserSessionRepository, audit *AuditUseCase,
+	producer *messaging.UserProducer, userCache *cache.UserCache,
+	resetCache *cache.PasswordResetCache, sessionTTL time.Duration) *UserUseCase {
 	return &UserUseCase{
-		DB:             db,
-		Log:            logger,
-		Validate:       validate,
-		UserRepository: userRepository,
-		UserProducer:   userProducer,
-		UserCache:      userCache,
+		DB: db, Log: log, Validate: validate,
+		Users: users, Roles: roles, Sessions: sessions, Audit: audit,
+		Producer: producer, UserCache: userCache, ResetCache: resetCache,
+		SessionTTL: sessionTTL,
 	}
 }
 
+// hashToken keeps the bearer token out of the database: a dump gives an
+// attacker hashes, not usable sessions.
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// Verify resolves a bearer token to an Auth, reading through the redis cache.
 func (c *UserUseCase) Verify(ctx context.Context, request *model.VerifyUserRequest) (*model.Auth, error) {
 	if err := c.Validate.Struct(request); err != nil {
-		c.Log.Warnf("Invalid request body : %+v", err)
-		return nil, fiber.ErrBadRequest
+		c.Log.Warnf("Invalid verify request : %+v", err)
+		return nil, fiber.ErrUnauthorized
 	}
 
-	// a cache hit skips the database round trip on every authenticated request
 	if auth, err := c.UserCache.Get(ctx, request.Token); err == nil && auth != nil {
-		c.Log.Debugf("Auth cache hit for token")
 		return auth, nil
 	}
 
 	tx := c.DB.WithContext(ctx).Begin()
 	defer tx.Rollback()
 
-	user := new(entity.User)
-	if err := c.UserRepository.FindByToken(tx, user, request.Token); err != nil {
-		c.Log.Warnf("Failed find user by token : %+v", err)
-		return nil, fiber.ErrNotFound
+	now := time.Now().UnixMilli()
+
+	session := new(entity.UserSession)
+	if err := c.Sessions.FindActiveByTokenHash(tx, session, hashToken(request.Token), now); err != nil {
+		c.Log.Warnf("No active session for token : %+v", err)
+		return nil, fiber.ErrUnauthorized
 	}
+
+	user := new(entity.User)
+	if err := c.Users.FindById(tx, user, session.UserID); err != nil {
+		c.Log.Warnf("Session points at a missing user : %+v", err)
+		return nil, fiber.ErrUnauthorized
+	}
+
+	if user.Status != entity.UserStatusActive {
+		c.Log.Warnf("Rejecting %s user %s", user.Status, user.ID)
+		return nil, fiber.ErrForbidden
+	}
+
+	if err := c.Users.LoadRoles(tx, user); err != nil {
+		c.Log.Warnf("Failed load roles : %+v", err)
+		return nil, fiber.ErrInternalServerError
+	}
+
+	// written outside the read path's critical section; a stale last_used_at
+	// is not worth a write on every single request
+	_ = c.Sessions.TouchLastUsed(tx, session.ID, now)
 
 	if err := tx.Commit().Error; err != nil {
 		c.Log.Warnf("Failed commit transaction : %+v", err)
 		return nil, fiber.ErrInternalServerError
 	}
 
-	auth := &model.Auth{ID: user.ID}
+	auth := converter.UserToAuth(user, session.ID)
 	if err := c.UserCache.Set(ctx, request.Token, auth); err != nil {
 		c.Log.Warnf("Failed cache auth token : %+v", err)
 	}
@@ -74,235 +113,379 @@ func (c *UserUseCase) Verify(ctx context.Context, request *model.VerifyUserReque
 }
 
 func (c *UserUseCase) Create(ctx context.Context, request *model.RegisterUserRequest) (*model.UserResponse, error) {
-	tx := c.DB.WithContext(ctx).Begin()
-	defer tx.Rollback()
-
-	err := c.Validate.Struct(request)
-	if err != nil {
-		c.Log.Warnf("Invalid request body : %+v", err)
+	if err := c.Validate.Struct(request); err != nil {
+		c.Log.Warnf("Invalid register request : %+v", err)
 		return nil, fiber.ErrBadRequest
 	}
 
-	total, err := c.UserRepository.CountById(tx, request.ID)
+	tx := c.DB.WithContext(ctx).Begin()
+	defer tx.Rollback()
+
+	email := strings.ToLower(strings.TrimSpace(request.Email))
+
+	total, err := c.Users.CountByEmail(tx, email)
 	if err != nil {
-		c.Log.Warnf("Failed count user from database : %+v", err)
+		c.Log.Warnf("Failed count users : %+v", err)
 		return nil, fiber.ErrInternalServerError
 	}
-
 	if total > 0 {
-		c.Log.Warnf("User already exists : %+v", err)
-		return nil, fiber.ErrConflict
+		return nil, fiber.NewError(fiber.StatusConflict, "that email is already registered")
 	}
 
 	password, err := bcrypt.GenerateFromPassword([]byte(request.Password), bcrypt.DefaultCost)
 	if err != nil {
-		c.Log.Warnf("Failed to generate bcrypt hash : %+v", err)
+		c.Log.Warnf("Failed to hash password : %+v", err)
 		return nil, fiber.ErrInternalServerError
+	}
+
+	timezone := request.Timezone
+	if timezone == "" {
+		timezone = "UTC"
 	}
 
 	user := &entity.User{
-		ID:       request.ID,
-		Password: string(password),
+		ID:       uuid.NewString(),
+		Email:    email,
 		Name:     request.Name,
+		Password: string(password),
+		Status:   entity.UserStatusActive,
+		Timezone: timezone,
 	}
 
-	if err := c.UserRepository.Create(tx, user); err != nil {
-		c.Log.Warnf("Failed create user to database : %+v", err)
+	if err := c.Users.Create(tx, user); err != nil {
+		c.Log.Warnf("Failed create user : %+v", err)
 		return nil, fiber.ErrInternalServerError
 	}
+
+	// every account starts with the plain user role; superadmin is only ever
+	// granted through the admin endpoint
+	role := new(entity.Role)
+	if err := c.Roles.FindBySlug(tx, role, entity.RoleUser); err != nil {
+		c.Log.Warnf("Seeded role %q is missing : %+v", entity.RoleUser, err)
+		return nil, fiber.ErrInternalServerError
+	}
+	if err := c.Users.AddRole(tx, user.ID, role.ID); err != nil {
+		c.Log.Warnf("Failed assign default role : %+v", err)
+		return nil, fiber.ErrInternalServerError
+	}
+	user.Roles = []entity.Role{*role}
+
+	c.Audit.Record(tx, AuditEntry{ActorID: &user.ID, Action: "user.registered", EntityType: "users", EntityID: &user.ID})
 
 	if err := tx.Commit().Error; err != nil {
 		c.Log.Warnf("Failed commit transaction : %+v", err)
 		return nil, fiber.ErrInternalServerError
 	}
 
-	if c.UserProducer != nil {
-		event := converter.UserToEvent(user)
-		c.Log.Info("Publishing user created event")
-		if err = c.UserProducer.Send(event); err != nil {
-			c.Log.Warnf("Failed publish user created event : %+v", err)
-			return nil, fiber.ErrInternalServerError
-		}
-	} else {
-		c.Log.Info("Kafka producer is disabled, skipping user created event")
-	}
+	c.publish(user, "user created")
 
 	return converter.UserToResponse(user), nil
 }
 
-func (c *UserUseCase) Login(ctx context.Context, request *model.LoginUserRequest) (*model.UserResponse, error) {
-	tx := c.DB.WithContext(ctx).Begin()
-	defer tx.Rollback()
-
+func (c *UserUseCase) Login(ctx context.Context, request *model.LoginUserRequest) (*model.LoginResponse, error) {
 	if err := c.Validate.Struct(request); err != nil {
-		c.Log.Warnf("Invalid request body  : %+v", err)
+		c.Log.Warnf("Invalid login request : %+v", err)
 		return nil, fiber.ErrBadRequest
 	}
 
+	tx := c.DB.WithContext(ctx).Begin()
+	defer tx.Rollback()
+
 	user := new(entity.User)
-	if err := c.UserRepository.FindById(tx, user, request.ID); err != nil {
-		c.Log.Warnf("Failed find user by id : %+v", err)
-		return nil, fiber.ErrUnauthorized
+	if err := c.Users.FindByEmail(tx, user, strings.ToLower(strings.TrimSpace(request.Email))); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// same error and roughly the same cost as a wrong password, so the
+			// response does not reveal which addresses are registered
+			bcrypt.CompareHashAndPassword([]byte("$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidin"), []byte(request.Password))
+			return nil, fiber.ErrUnauthorized
+		}
+		c.Log.Warnf("Failed find user by email : %+v", err)
+		return nil, fiber.ErrInternalServerError
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(request.Password)); err != nil {
-		c.Log.Warnf("Failed to compare user password with bcrypt hash : %+v", err)
 		return nil, fiber.ErrUnauthorized
 	}
 
-	previousToken := user.Token
-	user.Token = uuid.New().String()
-	if err := c.UserRepository.Update(tx, user); err != nil {
-		c.Log.Warnf("Failed save user : %+v", err)
+	if user.Status != entity.UserStatusActive {
+		return nil, fiber.NewError(fiber.StatusForbidden, "this account is suspended")
+	}
+
+	if err := c.Users.LoadRoles(tx, user); err != nil {
+		c.Log.Warnf("Failed load roles : %+v", err)
 		return nil, fiber.ErrInternalServerError
 	}
+
+	token, session, err := c.issueSession(tx, user, request.UserAgent, request.IP)
+	if err != nil {
+		return nil, err
+	}
+
+	c.Audit.Record(tx, AuditEntry{ActorID: &user.ID, Action: "user.logged_in", EntityType: "user_sessions", EntityID: &session.ID, IP: nilIfEmpty(request.IP)})
 
 	if err := tx.Commit().Error; err != nil {
 		c.Log.Warnf("Failed commit transaction : %+v", err)
 		return nil, fiber.ErrInternalServerError
 	}
 
-	// the replaced token must not keep resolving from cache
-	if previousToken != "" {
-		if err := c.UserCache.Delete(ctx, previousToken); err != nil {
-			c.Log.Warnf("Failed evict previous auth token : %+v", err)
-		}
+	c.publish(user, "user login")
+
+	return &model.LoginResponse{
+		Token:     token,
+		ExpiresAt: session.ExpiresAt,
+		User:      converter.UserToResponse(user),
+	}, nil
+}
+
+func (c *UserUseCase) issueSession(tx *gorm.DB, user *entity.User, userAgent, ip string) (string, *entity.UserSession, error) {
+	token := uuid.NewString() + uuid.NewString()
+	now := time.Now()
+
+	session := &entity.UserSession{
+		ID:         uuid.NewString(),
+		UserID:     user.ID,
+		TokenHash:  hashToken(token),
+		UserAgent:  nilIfEmpty(truncate(userAgent, 255)),
+		IP:         nilIfEmpty(ip),
+		ExpiresAt:  now.Add(c.SessionTTL).UnixMilli(),
+		LastUsedAt: now.UnixMilli(),
 	}
 
-	if c.UserProducer != nil {
-		event := converter.UserToEvent(user)
-		c.Log.Info("Publishing user login event")
-		if err := c.UserProducer.Send(event); err != nil {
-			c.Log.Warnf("Failed publish user login event : %+v", err)
-			return nil, fiber.ErrInternalServerError
-		}
-	} else {
-		c.Log.Info("Kafka producer is disabled, skipping user login event")
+	if err := c.Sessions.Create(tx, session); err != nil {
+		c.Log.Warnf("Failed create session : %+v", err)
+		return "", nil, fiber.ErrInternalServerError
 	}
 
-	return converter.UserToTokenResponse(user), nil
+	return token, session, nil
 }
 
 func (c *UserUseCase) Current(ctx context.Context, request *model.GetUserRequest) (*model.UserResponse, error) {
-	tx := c.DB.WithContext(ctx).Begin()
-	defer tx.Rollback()
-
 	if err := c.Validate.Struct(request); err != nil {
-		c.Log.Warnf("Invalid request body : %+v", err)
 		return nil, fiber.ErrBadRequest
 	}
 
+	tx := c.DB.WithContext(ctx).Begin()
+	defer tx.Rollback()
+
 	user := new(entity.User)
-	if err := c.UserRepository.FindById(tx, user, request.ID); err != nil {
-		c.Log.Warnf("Failed find user by id : %+v", err)
+	if err := c.Users.FindById(tx, user, request.ID); err != nil {
 		return nil, fiber.ErrNotFound
 	}
 
+	if err := c.Users.LoadRoles(tx, user); err != nil {
+		return nil, fiber.ErrInternalServerError
+	}
+
 	if err := tx.Commit().Error; err != nil {
-		c.Log.Warnf("Failed commit transaction : %+v", err)
 		return nil, fiber.ErrInternalServerError
 	}
 
 	return converter.UserToResponse(user), nil
 }
 
-func (c *UserUseCase) Logout(ctx context.Context, request *model.LogoutUserRequest) (bool, error) {
-	tx := c.DB.WithContext(ctx).Begin()
-	defer tx.Rollback()
-
-	if err := c.Validate.Struct(request); err != nil {
-		c.Log.Warnf("Invalid request body : %+v", err)
-		return false, fiber.ErrBadRequest
-	}
-
-	user := new(entity.User)
-	if err := c.UserRepository.FindById(tx, user, request.ID); err != nil {
-		c.Log.Warnf("Failed find user by id : %+v", err)
-		return false, fiber.ErrNotFound
-	}
-
-	revokedToken := user.Token
-	user.Token = ""
-
-	if err := c.UserRepository.Update(tx, user); err != nil {
-		c.Log.Warnf("Failed save user : %+v", err)
-		return false, fiber.ErrInternalServerError
-	}
-
-	if err := tx.Commit().Error; err != nil {
-		c.Log.Warnf("Failed commit transaction : %+v", err)
-		return false, fiber.ErrInternalServerError
-	}
-
-	// without this the revoked token would still authenticate until the ttl expires
-	if revokedToken != "" {
-		if err := c.UserCache.Delete(ctx, revokedToken); err != nil {
-			c.Log.Warnf("Failed evict revoked auth token : %+v", err)
-		}
-	}
-
-	if c.UserProducer != nil {
-		event := converter.UserToEvent(user)
-		c.Log.Info("Publishing user logout event")
-		if err := c.UserProducer.Send(event); err != nil {
-			c.Log.Warnf("Failed publish user logout event : %+v", err)
-			return false, fiber.ErrInternalServerError
-		}
-	} else {
-		c.Log.Info("Kafka producer is disabled, skipping user logout event")
-	}
-
-	return true, nil
-}
-
 func (c *UserUseCase) Update(ctx context.Context, request *model.UpdateUserRequest) (*model.UserResponse, error) {
-	tx := c.DB.WithContext(ctx).Begin()
-	defer tx.Rollback()
-
 	if err := c.Validate.Struct(request); err != nil {
-		c.Log.Warnf("Invalid request body : %+v", err)
+		c.Log.Warnf("Invalid update request : %+v", err)
 		return nil, fiber.ErrBadRequest
 	}
 
+	tx := c.DB.WithContext(ctx).Begin()
+	defer tx.Rollback()
+
 	user := new(entity.User)
-	if err := c.UserRepository.FindById(tx, user, request.ID); err != nil {
-		c.Log.Warnf("Failed find user by id : %+v", err)
+	if err := c.Users.FindById(tx, user, request.ID); err != nil {
 		return nil, fiber.ErrNotFound
 	}
 
 	if request.Name != "" {
 		user.Name = request.Name
 	}
-
+	if request.Timezone != "" {
+		user.Timezone = request.Timezone
+	}
 	if request.Password != "" {
 		password, err := bcrypt.GenerateFromPassword([]byte(request.Password), bcrypt.DefaultCost)
 		if err != nil {
-			c.Log.Warnf("Failed to generate bcrypt hash : %+v", err)
 			return nil, fiber.ErrInternalServerError
 		}
 		user.Password = string(password)
 	}
 
-	if err := c.UserRepository.Update(tx, user); err != nil {
+	if err := c.Users.Update(tx, user); err != nil {
 		c.Log.Warnf("Failed save user : %+v", err)
 		return nil, fiber.ErrInternalServerError
 	}
 
-	if err := tx.Commit().Error; err != nil {
-		c.Log.Warnf("Failed commit transaction : %+v", err)
+	if err := c.Users.LoadRoles(tx, user); err != nil {
 		return nil, fiber.ErrInternalServerError
 	}
 
-	if c.UserProducer != nil {
-		event := converter.UserToEvent(user)
-		c.Log.Info("Publishing user updated event")
-		if err := c.UserProducer.Send(event); err != nil {
-			c.Log.Warnf("Failed publish user updated event : %+v", err)
-			return nil, fiber.ErrInternalServerError
-		}
-	} else {
-		c.Log.Info("Kafka producer is disabled, skipping user updated event")
+	c.Audit.Record(tx, AuditEntry{ActorID: &user.ID, Action: "user.updated", EntityType: "users", EntityID: &user.ID})
+
+	if err := tx.Commit().Error; err != nil {
+		return nil, fiber.ErrInternalServerError
 	}
 
+	// a password change invalidates every session, including this one
+	if request.Password != "" {
+		c.revokeAllSessions(ctx, user.ID)
+	}
+
+	c.publish(user, "user updated")
+
 	return converter.UserToResponse(user), nil
+}
+
+func (c *UserUseCase) Logout(ctx context.Context, request *model.LogoutUserRequest) (bool, error) {
+	if err := c.Validate.Struct(request); err != nil {
+		return false, fiber.ErrBadRequest
+	}
+
+	tx := c.DB.WithContext(ctx).Begin()
+	defer tx.Rollback()
+
+	if err := c.Sessions.Revoke(tx, request.SessionID, time.Now().UnixMilli()); err != nil {
+		c.Log.Warnf("Failed revoke session : %+v", err)
+		return false, fiber.ErrInternalServerError
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return false, fiber.ErrInternalServerError
+	}
+
+	// without this the revoked token keeps authenticating until the TTL lapses
+	if request.Token != "" {
+		if err := c.UserCache.Delete(ctx, request.Token); err != nil {
+			c.Log.Warnf("Failed evict auth token : %+v", err)
+		}
+	}
+
+	return true, nil
+}
+
+func (c *UserUseCase) ListSessions(ctx context.Context, request *model.ListSessionRequest) ([]model.SessionResponse, error) {
+	if err := c.Validate.Struct(request); err != nil {
+		return nil, fiber.ErrBadRequest
+	}
+
+	sessions, err := c.Sessions.FindActiveByUser(c.DB.WithContext(ctx), request.UserID, time.Now().UnixMilli())
+	if err != nil {
+		c.Log.Warnf("Failed list sessions : %+v", err)
+		return nil, fiber.ErrInternalServerError
+	}
+
+	return converter.SessionsToResponses(sessions, request.CurrentSessionID), nil
+}
+
+func (c *UserUseCase) RevokeSession(ctx context.Context, request *model.RevokeSessionRequest) (bool, error) {
+	if err := c.Validate.Struct(request); err != nil {
+		return false, fiber.ErrBadRequest
+	}
+
+	tx := c.DB.WithContext(ctx).Begin()
+	defer tx.Rollback()
+
+	session := new(entity.UserSession)
+	if err := c.Sessions.FindByIdAndUser(tx, session, request.SessionID, request.UserID); err != nil {
+		return false, fiber.ErrNotFound
+	}
+
+	if err := c.Sessions.Revoke(tx, session.ID, time.Now().UnixMilli()); err != nil {
+		return false, fiber.ErrInternalServerError
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return false, fiber.ErrInternalServerError
+	}
+
+	// the raw token is not recoverable from the hash, so the cached entry is
+	// left to expire; it is bounded by REDIS_TTL_AUTH
+	return true, nil
+}
+
+func (c *UserUseCase) ForgotPassword(ctx context.Context, request *model.ForgotPasswordRequest) (bool, error) {
+	if err := c.Validate.Struct(request); err != nil {
+		return false, fiber.ErrBadRequest
+	}
+
+	user := new(entity.User)
+	err := c.Users.FindByEmail(c.DB.WithContext(ctx), user, strings.ToLower(strings.TrimSpace(request.Email)))
+	if err != nil {
+		// always report success: whether an address is registered is not
+		// something an unauthenticated caller should be able to probe
+		c.Log.Infof("Password reset requested for unknown address")
+		return true, nil
+	}
+
+	token := uuid.NewString() + uuid.NewString()
+	if err := c.ResetCache.Set(ctx, token, &model.PasswordReset{UserID: user.ID, Email: user.Email}); err != nil {
+		c.Log.Warnf("Failed store reset token : %+v", err)
+		return false, fiber.ErrInternalServerError
+	}
+
+	// delivery belongs to a notifier channel or a transactional mail provider;
+	// until one is wired the token is only logged
+	c.Log.Infof("Password reset token for %s: %s", user.Email, token)
+
+	return true, nil
+}
+
+func (c *UserUseCase) ResetPassword(ctx context.Context, request *model.ResetPasswordRequest) (bool, error) {
+	if err := c.Validate.Struct(request); err != nil {
+		return false, fiber.ErrBadRequest
+	}
+
+	reset, err := c.ResetCache.Get(ctx, request.Token)
+	if err != nil || reset == nil {
+		return false, fiber.NewError(fiber.StatusBadRequest, "that reset link is invalid or has expired")
+	}
+
+	tx := c.DB.WithContext(ctx).Begin()
+	defer tx.Rollback()
+
+	user := new(entity.User)
+	if err := c.Users.FindById(tx, user, reset.UserID); err != nil {
+		return false, fiber.ErrNotFound
+	}
+
+	password, err := bcrypt.GenerateFromPassword([]byte(request.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return false, fiber.ErrInternalServerError
+	}
+	user.Password = string(password)
+
+	if err := c.Users.Update(tx, user); err != nil {
+		return false, fiber.ErrInternalServerError
+	}
+
+	c.Audit.Record(tx, AuditEntry{ActorID: &user.ID, Action: "user.password_reset", EntityType: "users", EntityID: &user.ID})
+
+	if err := tx.Commit().Error; err != nil {
+		return false, fiber.ErrInternalServerError
+	}
+
+	// single use
+	_ = c.ResetCache.Delete(ctx, request.Token)
+	c.revokeAllSessions(ctx, user.ID)
+
+	return true, nil
+}
+
+// revokeAllSessions is used whenever a credential changes.
+func (c *UserUseCase) revokeAllSessions(ctx context.Context, userID string) {
+	_, err := c.Sessions.RevokeAllForUser(c.DB.WithContext(ctx), userID, time.Now().UnixMilli())
+	if err != nil {
+		c.Log.Warnf("Failed revoke sessions for %s : %+v", userID, err)
+	}
+}
+
+func (c *UserUseCase) publish(user *entity.User, what string) {
+	if c.Producer == nil {
+		c.Log.Debugf("Kafka producer is disabled, skipping %s event", what)
+		return
+	}
+
+	if err := c.Producer.Send(converter.UserToEvent(user)); err != nil {
+		c.Log.Warnf("Failed publish %s event : %+v", what, err)
+	}
 }
