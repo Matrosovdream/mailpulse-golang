@@ -1,29 +1,56 @@
 package middleware
 
 import (
+	"strings"
+
 	"mailpulse/internal/model"
 	"mailpulse/internal/usecase"
 
 	"github.com/gofiber/fiber/v2"
 )
 
+const (
+	authLocalsKey  = "auth"
+	tokenLocalsKey = "auth_token"
+)
+
+// NewAuth resolves the bearer token to an Auth and puts it on the request.
+// Both the raw header form and "Bearer <token>" are accepted, because every
+// SPA HTTP client defaults to one or the other.
 func NewAuth(userUseCase *usecase.UserUseCase) fiber.Handler {
 	return func(ctx *fiber.Ctx) error {
-		request := &model.VerifyUserRequest{Token: ctx.Get("Authorization", "NOT_FOUND")}
-		userUseCase.Log.Debugf("Authorization : %s", request.Token)
+		token := strings.TrimSpace(ctx.Get("Authorization"))
+		token = strings.TrimPrefix(token, "Bearer ")
+		token = strings.TrimPrefix(token, "bearer ")
 
-		auth, err := userUseCase.Verify(ctx.UserContext(), request)
-		if err != nil {
-			userUseCase.Log.Warnf("Failed find user by token : %+v", err)
+		if token == "" {
 			return fiber.ErrUnauthorized
 		}
 
-		userUseCase.Log.Debugf("User : %+v", auth.ID)
-		ctx.Locals("auth", auth)
+		auth, err := userUseCase.Verify(ctx.UserContext(), &model.VerifyUserRequest{Token: token})
+		if err != nil {
+			return err
+		}
+
+		ctx.Locals(authLocalsKey, auth)
+		ctx.Locals(tokenLocalsKey, token)
 		return ctx.Next()
 	}
 }
 
+// GetUser returns the authenticated caller. Only ever called from handlers
+// mounted behind NewAuth, so the value is always present.
 func GetUser(ctx *fiber.Ctx) *model.Auth {
-	return ctx.Locals("auth").(*model.Auth)
+	auth, ok := ctx.Locals(authLocalsKey).(*model.Auth)
+	if !ok {
+		return &model.Auth{}
+	}
+	return auth
+}
+
+// GetToken returns the raw bearer token, which logout needs in order to evict
+// the cache entry keyed by it.
+func GetToken(ctx *fiber.Ctx) string {
+	token, _ := ctx.Locals(tokenLocalsKey).(string)
+	return token
 }
