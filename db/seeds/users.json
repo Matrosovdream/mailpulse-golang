@@ -1,0 +1,10 @@
+[
+  {
+    "email": "admin@gmail.com",
+    "name": "Admin",
+    "password": "123",
+    "status": "active",
+    "timezone": "UTC",
+    "roles": ["user", "superadmin"]
+  }
+]

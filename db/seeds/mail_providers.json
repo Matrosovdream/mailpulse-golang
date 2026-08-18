@@ -1,0 +1,81 @@
+[
+  {
+    "slug": "imap",
+    "label": "Generic IMAP",
+    "kind": "imap",
+    "auth_modes": "password,app_password",
+    "default_port": 993,
+    "default_use_tls": true,
+    "enabled": true,
+    "position": 0
+  },
+  {
+    "slug": "yandex",
+    "label": "Yandex Mail",
+    "kind": "imap",
+    "auth_modes": "app_password",
+    "default_host": "imap.yandex.com",
+    "default_port": 993,
+    "default_use_tls": true,
+    "help_url": "https://yandex.com/support/mail/mail-clients/others.html",
+    "enabled": true,
+    "position": 1
+  },
+  {
+    "slug": "mailru",
+    "label": "Mail.ru",
+    "kind": "imap",
+    "auth_modes": "app_password",
+    "default_host": "imap.mail.ru",
+    "default_port": 993,
+    "default_use_tls": true,
+    "help_url": "https://help.mail.ru/mail/mailer/popsmtp",
+    "enabled": true,
+    "position": 2
+  },
+  {
+    "slug": "fastmail",
+    "label": "Fastmail",
+    "kind": "imap",
+    "auth_modes": "app_password",
+    "default_host": "imap.fastmail.com",
+    "default_port": 993,
+    "default_use_tls": true,
+    "enabled": true,
+    "position": 3
+  },
+  {
+    "slug": "zoho",
+    "label": "Zoho Mail",
+    "kind": "imap",
+    "auth_modes": "app_password",
+    "default_host": "imap.zoho.com",
+    "default_port": 993,
+    "default_use_tls": true,
+    "enabled": true,
+    "position": 4
+  },
+  {
+    "slug": "gmail",
+    "label": "Gmail",
+    "kind": "imap",
+    "auth_modes": "app_password,oauth2",
+    "default_host": "imap.gmail.com",
+    "default_port": 993,
+    "default_use_tls": true,
+    "help_url": "https://support.google.com/mail/answer/185833",
+    "enabled": false,
+    "position": 5
+  },
+  {
+    "slug": "outlook",
+    "label": "Outlook",
+    "kind": "imap",
+    "auth_modes": "app_password,oauth2",
+    "default_host": "outlook.office365.com",
+    "default_port": 993,
+    "default_use_tls": true,
+    "enabled": false,
+    "position": 6
+  }
+]
