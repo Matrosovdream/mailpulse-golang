@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -21,25 +22,29 @@ import (
 )
 
 type MailAccountUseCase struct {
-	DB        *gorm.DB
-	Log       *logrus.Logger
-	Validate  *validator.Validate
-	Accounts  *repository.MailAccountRepository
-	Watchers  *repository.WatcherRepository
-	SyncRuns  *repository.MailSyncRunRepository
-	Providers *mail.Registry
-	Cipher    *secret.Cipher
-	Audit     *AuditUseCase
-	Pipeline  *PipelineUseCase
+	DB           *gorm.DB
+	Log          *logrus.Logger
+	Validate     *validator.Validate
+	Accounts     *repository.MailAccountRepository
+	ProviderRows *repository.MailProviderRepository
+	Resolver     *MailResolver
+	Watchers     *repository.WatcherRepository
+	SyncRuns     *repository.MailSyncRunRepository
+	Providers    *mail.Registry
+	Cipher       *secret.Cipher
+	Audit        *AuditUseCase
+	Pipeline     *PipelineUseCase
 }
 
 func NewMailAccountUseCase(db *gorm.DB, log *logrus.Logger, validate *validator.Validate,
-	accounts *repository.MailAccountRepository, watchers *repository.WatcherRepository,
+	accounts *repository.MailAccountRepository, mailProviders *repository.MailProviderRepository,
+	watchers *repository.WatcherRepository,
 	syncRuns *repository.MailSyncRunRepository, providers *mail.Registry,
-	cipher *secret.Cipher, audit *AuditUseCase, pipeline *PipelineUseCase) *MailAccountUseCase {
+	cipher *secret.Cipher, audit *AuditUseCase, pipeline *PipelineUseCase,
+	resolver *MailResolver) *MailAccountUseCase {
 	return &MailAccountUseCase{
-		DB: db, Log: log, Validate: validate,
-		Accounts: accounts, Watchers: watchers, SyncRuns: syncRuns,
+		DB: db, Log: log, Validate: validate, Resolver: resolver,
+		Accounts: accounts, ProviderRows: mailProviders, Watchers: watchers, SyncRuns: syncRuns,
 		Providers: providers, Cipher: cipher, Audit: audit, Pipeline: pipeline,
 	}
 }
@@ -50,17 +55,28 @@ func (c *MailAccountUseCase) Create(ctx context.Context, request *model.CreateMa
 		return nil, fiber.ErrBadRequest
 	}
 
-	if request.Provider == entity.MailProviderIMAP {
-		if request.ImapHost == "" || request.ImapPort == 0 {
-			return nil, fiber.NewError(fiber.StatusBadRequest, "imap accounts need imap_host and imap_port")
-		}
-		if request.AuthType == entity.MailAuthPassword && request.Password == "" {
-			return nil, fiber.NewError(fiber.StatusBadRequest, "imap accounts need a password")
-		}
-	}
-
 	tx := c.DB.WithContext(ctx).Begin()
 	defer tx.Rollback()
+
+	provider, err := c.provider(tx, request.Provider)
+	if err != nil {
+		return nil, err
+	}
+
+	authMode := request.AuthMode
+	if authMode == "" {
+		authMode = provider.AuthModeList()[0]
+	}
+	if !provider.SupportsAuthMode(authMode) {
+		return nil, fiber.NewError(fiber.StatusBadRequest,
+			fmt.Sprintf("%s does not support %s, it supports %s",
+				provider.Label, authMode, provider.AuthModes))
+	}
+
+	settings, err := c.mergeSettings(provider, nil, request.Settings)
+	if err != nil {
+		return nil, err
+	}
 
 	email := strings.ToLower(strings.TrimSpace(request.EmailAddress))
 
@@ -72,15 +88,12 @@ func (c *MailAccountUseCase) Create(ctx context.Context, request *model.CreateMa
 		return nil, fiber.NewError(fiber.StatusConflict, "that mailbox is already connected")
 	}
 
-	credentials, err := model.MailAccountCredentials{Password: request.Password}.Encode()
+	encrypted, err := c.encryptCredentials(model.MailAccountCredentials{
+		Username: request.Username,
+		Password: request.Password,
+	})
 	if err != nil {
-		return nil, fiber.ErrInternalServerError
-	}
-
-	encrypted, err := c.Cipher.Encrypt(credentials)
-	if err != nil {
-		c.Log.Warnf("Failed encrypt credentials : %+v", err)
-		return nil, fiber.ErrInternalServerError
+		return nil, err
 	}
 
 	interval := request.PollIntervalSeconds
@@ -88,28 +101,19 @@ func (c *MailAccountUseCase) Create(ctx context.Context, request *model.CreateMa
 		interval = 120
 	}
 
-	useTLS := true
-	if request.ImapUseTLS != nil {
-		useTLS = *request.ImapUseTLS
-	}
-
 	account := &entity.MailAccount{
 		ID:                  uuid.NewString(),
 		UserID:              request.UserID,
-		Provider:            request.Provider,
+		Provider:            provider.Slug,
 		EmailAddress:        email,
 		DisplayName:         nilIfEmpty(request.DisplayName),
-		AuthType:            request.AuthType,
+		AuthMode:            authMode,
 		Credentials:         encrypted,
-		ImapHost:            nilIfEmpty(request.ImapHost),
-		ImapUseTLS:          useTLS,
+		Settings:            settings,
 		Status:              entity.MailAccountStatusPending,
 		SyncState:           entity.JSON("{}"),
 		PollIntervalSeconds: interval,
 		NextPollAt:          time.Now().UnixMilli(),
-	}
-	if request.ImapPort > 0 {
-		account.ImapPort = &request.ImapPort
 	}
 
 	if err := c.Accounts.Create(tx, account); err != nil {
@@ -124,7 +128,106 @@ func (c *MailAccountUseCase) Create(ctx context.Context, request *model.CreateMa
 		return nil, fiber.ErrInternalServerError
 	}
 
-	return converter.MailAccountToResponse(account), nil
+	return c.describe(c.DB.WithContext(ctx), account), nil
+}
+
+// provider resolves the slug against the table and refuses one with no client
+// registered, so a seed row can never point at an implementation that is not
+// compiled in.
+func (c *MailAccountUseCase) provider(db *gorm.DB, slug string) (*entity.MailProvider, error) {
+	provider := new(entity.MailProvider)
+	if err := c.ProviderRows.FindBySlug(db, provider, slug); err != nil {
+		return nil, fiber.NewError(fiber.StatusBadRequest,
+			fmt.Sprintf("unknown mail provider %q", slug))
+	}
+
+	if !provider.Enabled {
+		return nil, fiber.NewError(fiber.StatusBadRequest,
+			fmt.Sprintf("%s is not available yet", provider.Label))
+	}
+
+	if !c.Providers.Has(provider.Kind) {
+		return nil, fiber.NewError(fiber.StatusNotImplemented,
+			fmt.Sprintf("%s needs the %s client, which is not built yet", provider.Label, provider.Kind))
+	}
+
+	return provider, nil
+}
+
+// mergeSettings layers the caller's settings over the provider's presets, so a
+// connect form only has to send what the user actually typed.
+func (c *MailAccountUseCase) mergeSettings(provider *entity.MailProvider, existing entity.JSON,
+	incoming json.RawMessage) (entity.JSON, error) {
+	merged := map[string]any{}
+
+	if len(existing) > 0 {
+		if err := json.Unmarshal(existing, &merged); err != nil {
+			return nil, fiber.ErrInternalServerError
+		}
+	} else {
+		if provider.DefaultHost != nil {
+			merged["host"] = *provider.DefaultHost
+		}
+		if provider.DefaultPort != nil {
+			merged["port"] = *provider.DefaultPort
+		}
+		merged["use_tls"] = provider.DefaultUseTLS
+	}
+
+	if len(incoming) > 0 {
+		supplied := map[string]any{}
+		if err := json.Unmarshal(incoming, &supplied); err != nil {
+			return nil, fiber.NewError(fiber.StatusBadRequest, "settings must be a JSON object")
+		}
+		for key, value := range supplied {
+			merged[key] = value
+		}
+	}
+
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		return nil, fiber.ErrInternalServerError
+	}
+
+	return entity.JSON(encoded), nil
+}
+
+func (c *MailAccountUseCase) encryptCredentials(credentials model.MailAccountCredentials) (string, error) {
+	return c.Resolver.Encrypt(credentials)
+}
+
+// describe decorates a response with the provider label and kind, which the
+// SPA needs to pick the right icon and form.
+func (c *MailAccountUseCase) describe(db *gorm.DB, account *entity.MailAccount) *model.MailAccountResponse {
+	response := converter.MailAccountToResponse(account)
+
+	provider := new(entity.MailProvider)
+	if err := c.ProviderRows.FindBySlug(db, provider, account.Provider); err == nil {
+		response.ProviderLabel = provider.Label
+		response.Kind = provider.Kind
+	}
+
+	return response
+}
+
+// decorate fills provider labels for a page of rows in one query.
+func (c *MailAccountUseCase) decorate(db *gorm.DB, responses []model.MailAccountResponse) {
+	rows, err := c.ProviderRows.FindAll(db)
+	if err != nil {
+		return
+	}
+
+	byslug := make(map[string]entity.MailProvider, len(rows))
+	for i := range rows {
+		byslug[rows[i].Slug] = rows[i]
+	}
+
+	for i := range responses {
+		if row, ok := byslug[responses[i].Provider]; ok {
+			responses[i].ProviderLabel = row.Label
+			responses[i].Kind = row.Kind
+		}
+	}
 }
 
 func (c *MailAccountUseCase) List(ctx context.Context, request *model.ListMailAccountRequest) ([]model.MailAccountResponse, *model.PageMetadata, error) {
@@ -143,15 +246,21 @@ func (c *MailAccountUseCase) List(ctx context.Context, request *model.ListMailAc
 	}
 
 	metadata := model.NewPageMetadata(request.Page, request.Size, total)
-	return converter.MailAccountsToResponses(accounts), &metadata, nil
+	responses := converter.MailAccountsToResponses(accounts)
+	c.decorate(c.DB.WithContext(ctx), responses)
+
+	return responses, &metadata, nil
 }
 
 func (c *MailAccountUseCase) Get(ctx context.Context, request *model.GetMailAccountRequest) (*model.MailAccountResponse, error) {
-	account, err := c.find(c.DB.WithContext(ctx), request.ID, request.UserID)
+	db := c.DB.WithContext(ctx)
+
+	account, err := c.find(db, request.ID, request.UserID)
 	if err != nil {
 		return nil, err
 	}
-	return converter.MailAccountToResponse(account), nil
+
+	return c.describe(db, account), nil
 }
 
 // find is the tenant-scoped read every other method starts from.
@@ -179,12 +288,6 @@ func (c *MailAccountUseCase) Update(ctx context.Context, request *model.UpdateMa
 	if request.DisplayName != "" {
 		account.DisplayName = &request.DisplayName
 	}
-	if request.ImapHost != "" {
-		account.ImapHost = &request.ImapHost
-	}
-	if request.ImapPort > 0 {
-		account.ImapPort = &request.ImapPort
-	}
 	if request.PollIntervalSeconds > 0 {
 		account.PollIntervalSeconds = request.PollIntervalSeconds
 	}
@@ -192,16 +295,43 @@ func (c *MailAccountUseCase) Update(ctx context.Context, request *model.UpdateMa
 		account.Status = request.Status
 	}
 
-	// re-entering the password sends the account back for verification
-	if request.Password != "" {
-		credentials, err := model.MailAccountCredentials{Password: request.Password}.Encode()
+	// changing where we connect sends the account back for verification
+	if len(request.Settings) > 0 {
+		provider, err := c.provider(tx, account.Provider)
 		if err != nil {
-			return nil, fiber.ErrInternalServerError
+			return nil, err
 		}
-		encrypted, err := c.Cipher.Encrypt(credentials)
+
+		merged, err := c.mergeSettings(provider, account.Settings, request.Settings)
 		if err != nil {
-			return nil, fiber.ErrInternalServerError
+			return nil, err
 		}
+
+		account.Settings = merged
+		account.Status = entity.MailAccountStatusPending
+	}
+
+	// Credentials are decrypted and merged rather than rebuilt: changing only
+	// the password must not wipe the username, which some servers need and
+	// which the caller has no way to re-send (it is never returned).
+	if request.Password != "" || request.Username != "" {
+		credentials, err := c.decryptCredentials(account)
+		if err != nil {
+			return nil, err
+		}
+
+		if request.Username != "" {
+			credentials.Username = request.Username
+		}
+		if request.Password != "" {
+			credentials.Password = request.Password
+		}
+
+		encrypted, err := c.encryptCredentials(credentials)
+		if err != nil {
+			return nil, err
+		}
+
 		account.Credentials = encrypted
 		account.Status = entity.MailAccountStatusPending
 	}
@@ -217,7 +347,7 @@ func (c *MailAccountUseCase) Update(ctx context.Context, request *model.UpdateMa
 		return nil, fiber.ErrInternalServerError
 	}
 
-	return converter.MailAccountToResponse(account), nil
+	return c.describe(c.DB.WithContext(ctx), account), nil
 }
 
 func (c *MailAccountUseCase) Delete(ctx context.Context, request *model.GetMailAccountRequest) (bool, error) {
@@ -254,36 +384,13 @@ func (c *MailAccountUseCase) Delete(ctx context.Context, request *model.GetMailA
 	return true, nil
 }
 
-// providerAccount decrypts the stored credentials into the gateway's view.
-func (c *MailAccountUseCase) providerAccount(account *entity.MailAccount) (mail.Account, error) {
-	plaintext, err := c.Cipher.Decrypt(account.Credentials)
-	if err != nil {
-		return mail.Account{}, fiber.NewError(fiber.StatusInternalServerError, "stored credentials could not be decrypted")
-	}
+// decryptCredentials reads the encrypted blob back into its parts.
+func (c *MailAccountUseCase) decryptCredentials(account *entity.MailAccount) (model.MailAccountCredentials, error) {
+	return c.Resolver.Credentials(account)
+}
 
-	var credentials model.MailAccountCredentials
-	if plaintext != "" {
-		_ = json.Unmarshal([]byte(plaintext), &credentials)
-	}
-
-	out := mail.Account{
-		ID:           account.ID,
-		Provider:     account.Provider,
-		EmailAddress: account.EmailAddress,
-		AuthType:     account.AuthType,
-		UseTLS:       account.ImapUseTLS,
-		Password:     credentials.Password,
-		AccessToken:  credentials.AccessToken,
-		RefreshToken: credentials.RefreshToken,
-	}
-	if account.ImapHost != nil {
-		out.Host = *account.ImapHost
-	}
-	if account.ImapPort != nil {
-		out.Port = *account.ImapPort
-	}
-
-	return out, nil
+func (c *MailAccountUseCase) resolve(db *gorm.DB, account *entity.MailAccount) (mail.Provider, mail.Account, error) {
+	return c.Resolver.Resolve(db, account)
 }
 
 func (c *MailAccountUseCase) Verify(ctx context.Context, request *model.GetMailAccountRequest) (*model.VerifyMailAccountResponse, error) {
@@ -295,18 +402,13 @@ func (c *MailAccountUseCase) Verify(ctx context.Context, request *model.GetMailA
 		return nil, err
 	}
 
-	provider, err := c.Providers.Get(account.Provider)
-	if err != nil {
-		return nil, err
-	}
-
-	target, err := c.providerAccount(account)
+	client, target, err := c.resolve(tx, account)
 	if err != nil {
 		return nil, err
 	}
 
 	now := time.Now().UnixMilli()
-	folders, verifyErr := provider.Verify(ctx, target)
+	folders, verifyErr := client.Verify(ctx, target)
 
 	if verifyErr != nil {
 		account.Status = entity.MailAccountStatusError
@@ -339,24 +441,21 @@ func (c *MailAccountUseCase) Verify(ctx context.Context, request *model.GetMailA
 }
 
 func (c *MailAccountUseCase) Folders(ctx context.Context, request *model.GetMailAccountRequest) ([]model.FolderResponse, error) {
-	account, err := c.find(c.DB.WithContext(ctx), request.ID, request.UserID)
+	db := c.DB.WithContext(ctx)
+
+	account, err := c.find(db, request.ID, request.UserID)
 	if err != nil {
 		return nil, err
 	}
 
-	provider, err := c.Providers.Get(account.Provider)
+	client, target, err := c.resolve(db, account)
 	if err != nil {
 		return nil, err
 	}
 
-	target, err := c.providerAccount(account)
+	folders, err := mail.ListFolders(ctx, client, target)
 	if err != nil {
 		return nil, err
-	}
-
-	folders, err := provider.Folders(ctx, target)
-	if err != nil {
-		return nil, fiber.NewError(fiber.StatusUnprocessableEntity, err.Error())
 	}
 
 	responses := make([]model.FolderResponse, 0, len(folders))
@@ -400,6 +499,89 @@ func (c *MailAccountUseCase) ListSyncRuns(ctx context.Context, request *model.Ge
 
 	metadata := model.NewPageMetadata(page.Page, page.Size, total)
 	return converter.SyncRunsToResponses(runs), &metadata, nil
+}
+
+// ReverifyDue re-checks stored credentials on a schedule.
+//
+// Credentials rot: app passwords get revoked, hosts change, tokens expire. This
+// is what turns "your watcher silently stopped weeks ago" into a status the
+// dashboard can show. A failing account is marked error, which also takes it
+// out of the poll queue, and a recovering one is picked back up automatically.
+func (c *MailAccountUseCase) ReverifyDue(ctx context.Context, olderThan time.Duration, limit int) (checked int, failed int, err error) {
+	db := c.DB.WithContext(ctx)
+	before := time.Now().Add(-olderThan).UnixMilli()
+
+	var accounts []entity.MailAccount
+	err = db.Transaction(func(tx *gorm.DB) error {
+		found, txErr := c.Accounts.FindStale(tx, before, limit)
+		if txErr != nil {
+			return txErr
+		}
+		accounts = found
+
+		// stamp the attempt inside the claim so a second worker starting now
+		// does not re-check the same accounts
+		now := time.Now().UnixMilli()
+		for i := range accounts {
+			if txErr := tx.Model(&entity.MailAccount{}).Where("id = ?", accounts[i].ID).
+				Update("last_verified_at", now).Error; txErr != nil {
+				return txErr
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+
+	for i := range accounts {
+		account := &accounts[i]
+		checked++
+
+		if c.reverifyOne(ctx, db, account) != nil {
+			failed++
+		}
+	}
+
+	return checked, failed, nil
+}
+
+func (c *MailAccountUseCase) reverifyOne(ctx context.Context, db *gorm.DB, account *entity.MailAccount) error {
+	fail := func(cause error) error {
+		account.Status = entity.MailAccountStatusError
+		account.LastError = ptr(cause.Error())
+		if err := c.Accounts.Update(db, account); err != nil {
+			c.Log.WithError(err).Warnf("Failed to record a credential failure for %s", account.ID)
+		}
+		c.Log.Warnf("Credentials for %s no longer work: %v", account.EmailAddress, cause)
+		return cause
+	}
+
+	client, target, err := c.resolve(db, account)
+	if err != nil {
+		return fail(err)
+	}
+
+	if _, err := client.Verify(ctx, target); err != nil {
+		return fail(err)
+	}
+
+	wasBroken := account.Status != entity.MailAccountStatusVerified
+
+	account.Status = entity.MailAccountStatusVerified
+	account.LastVerifiedAt = ptr(time.Now().UnixMilli())
+	account.LastError = nil
+
+	if err := c.Accounts.Update(db, account); err != nil {
+		c.Log.WithError(err).Warnf("Failed to record a credential success for %s", account.ID)
+		return err
+	}
+
+	if wasBroken {
+		c.Log.Infof("Credentials for %s work again, resuming polling", account.EmailAddress)
+	}
+
+	return nil
 }
 
 // Authorize returns the consent URL the SPA redirects to. Wiring a real client

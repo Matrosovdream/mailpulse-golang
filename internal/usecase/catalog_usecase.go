@@ -4,10 +4,13 @@ import (
 	"context"
 
 	"mailpulse/internal/entity"
+	"mailpulse/internal/gateway/mail"
 	gwnotifier "mailpulse/internal/gateway/notifier"
 	"mailpulse/internal/model"
+	"mailpulse/internal/repository"
 	"mailpulse/internal/usecase/event"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -16,20 +19,83 @@ import (
 // CatalogUseCase publishes what the system can do so the SPA renders its forms
 // from the registries instead of hard-coding lists that drift from the server.
 type CatalogUseCase struct {
-	Log      *logrus.Logger
-	DB       *gorm.DB
-	Redis    *redis.Client
-	Handlers *event.Registry
-	Channels *gwnotifier.Registry
-	Version  string
+	Log           *logrus.Logger
+	DB            *gorm.DB
+	Redis         *redis.Client
+	Handlers      *event.Registry
+	Channels      *gwnotifier.Registry
+	MailClients   *mail.Registry
+	MailProviders *repository.MailProviderRepository
+	Version       string
 }
 
 func NewCatalogUseCase(db *gorm.DB, redisClient *redis.Client, log *logrus.Logger,
-	handlers *event.Registry, channels *gwnotifier.Registry, version string) *CatalogUseCase {
+	handlers *event.Registry, channels *gwnotifier.Registry, mailClients *mail.Registry,
+	mailProviders *repository.MailProviderRepository, version string) *CatalogUseCase {
 	return &CatalogUseCase{
 		DB: db, Redis: redisClient, Log: log,
-		Handlers: handlers, Channels: channels, Version: version,
+		Handlers: handlers, Channels: channels,
+		MailClients: mailClients, MailProviders: mailProviders, Version: version,
 	}
+}
+
+// MailProviderTypes merges what the database says a user may connect with what
+// the registry says that client can actually do. It is the missing counterpart
+// to /api/event-types and /api/notifier-types: with it, the connect form is
+// rendered from the server and adding Fastmail needs no front-end release.
+func (c *CatalogUseCase) MailProviderTypes(ctx context.Context) ([]model.MailProviderResponse, error) {
+	rows, err := c.MailProviders.FindEnabled(c.DB.WithContext(ctx))
+	if err != nil {
+		c.Log.Warnf("Failed list mail providers : %+v", err)
+		return nil, fiber.ErrInternalServerError
+	}
+
+	descriptors := c.MailClients.Descriptors()
+
+	responses := make([]model.MailProviderResponse, 0, len(rows))
+	for i := range rows {
+		row := rows[i]
+
+		response := model.MailProviderResponse{
+			Slug:      row.Slug,
+			Label:     row.Label,
+			Kind:      row.Kind,
+			AuthModes: row.AuthModeList(),
+			HelpURL:   row.HelpURL,
+			Defaults:  map[string]any{"use_tls": row.DefaultUseTLS},
+		}
+
+		if row.DefaultHost != nil {
+			response.Defaults["host"] = *row.DefaultHost
+		}
+		if row.DefaultPort != nil {
+			response.Defaults["port"] = *row.DefaultPort
+		}
+
+		// a row whose client is not compiled in is listed but not offered,
+		// rather than failing only once someone tries to connect
+		descriptor, ok := descriptors[row.Kind]
+		if !ok {
+			response.Available = false
+			response.Unavailable = "the " + row.Kind + " client is not built yet"
+			responses = append(responses, response)
+			continue
+		}
+
+		response.Available = true
+		response.ConfigSchema = descriptor.ConfigSchema
+		response.Capabilities = map[string]bool{
+			"folders":       descriptor.Capabilities.Folders,
+			"labels":        descriptor.Capabilities.Labels,
+			"push":          descriptor.Capabilities.Push,
+			"idle":          descriptor.Capabilities.Idle,
+			"server_search": descriptor.Capabilities.ServerSearch,
+		}
+
+		responses = append(responses, response)
+	}
+
+	return responses, nil
 }
 
 func (c *CatalogUseCase) EventTypes() []model.EventTypeResponse {

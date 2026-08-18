@@ -419,12 +419,7 @@ func (c *WatcherUseCase) Test(ctx context.Context, request *model.TestWatcherReq
 		return nil, fiber.ErrNotFound
 	}
 
-	provider, err := providers.Get(account.Provider)
-	if err != nil {
-		return nil, err
-	}
-
-	target, err := accountUC.providerAccount(account)
+	provider, target, err := accountUC.Resolver.Resolve(db, account)
 	if err != nil {
 		return nil, err
 	}

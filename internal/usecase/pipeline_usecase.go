@@ -36,6 +36,7 @@ type PipelineUseCase struct {
 	SyncRuns *repository.MailSyncRunRepository
 	Provider *mail.Registry
 	Cipher   *secret.Cipher
+	Resolver *MailResolver
 }
 
 func NewPipelineUseCase(db *gorm.DB, log *logrus.Logger,
@@ -43,11 +44,11 @@ func NewPipelineUseCase(db *gorm.DB, log *logrus.Logger,
 	filters *repository.WatcherFilterRepository, events *repository.WatcherEventRepository,
 	matches *repository.MatchedEmailRepository, runs *repository.EventRunRepository,
 	syncRuns *repository.MailSyncRunRepository, provider *mail.Registry,
-	cipher *secret.Cipher) *PipelineUseCase {
+	cipher *secret.Cipher, resolver *MailResolver) *PipelineUseCase {
 	return &PipelineUseCase{
 		DB: db, Log: log, Accounts: accounts, Watchers: watchers, Filters: filters,
 		Events: events, Matches: matches, Runs: runs, SyncRuns: syncRuns,
-		Provider: provider, Cipher: cipher,
+		Provider: provider, Cipher: cipher, Resolver: resolver,
 	}
 }
 
@@ -117,13 +118,7 @@ func (c *PipelineUseCase) SyncAccount(ctx context.Context, account *entity.MailA
 		}
 	}
 
-	provider, err := c.Provider.Get(account.Provider)
-	if err != nil {
-		finish(entity.SyncStatusError, 0, 0, err)
-		return nil, err
-	}
-
-	target, err := c.providerAccount(account)
+	provider, target, err := c.Resolver.Resolve(db, account)
 	if err != nil {
 		finish(entity.SyncStatusError, 0, 0, err)
 		return nil, err
@@ -305,35 +300,4 @@ func (c *PipelineUseCase) ScheduleEvents(ctx context.Context, watcher *entity.Wa
 	}
 
 	return nil
-}
-
-func (c *PipelineUseCase) providerAccount(account *entity.MailAccount) (mail.Account, error) {
-	plaintext, err := c.Cipher.Decrypt(account.Credentials)
-	if err != nil {
-		return mail.Account{}, err
-	}
-
-	var credentials model.MailAccountCredentials
-	if plaintext != "" {
-		_ = json.Unmarshal([]byte(plaintext), &credentials)
-	}
-
-	out := mail.Account{
-		ID:           account.ID,
-		Provider:     account.Provider,
-		EmailAddress: account.EmailAddress,
-		AuthType:     account.AuthType,
-		UseTLS:       account.ImapUseTLS,
-		Password:     credentials.Password,
-		AccessToken:  credentials.AccessToken,
-		RefreshToken: credentials.RefreshToken,
-	}
-	if account.ImapHost != nil {
-		out.Host = *account.ImapHost
-	}
-	if account.ImapPort != nil {
-		out.Port = *account.ImapPort
-	}
-
-	return out, nil
 }

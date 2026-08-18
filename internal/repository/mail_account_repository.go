@@ -52,6 +52,21 @@ func (r *MailAccountRepository) FindDue(db *gorm.DB, now int64, limit int) ([]en
 	return accounts, err
 }
 
+// FindStale returns accounts whose credentials have not been checked since
+// `before`. Accounts already in error are included so a mailbox that comes back
+// (password fixed at the provider, server outage over) recovers on its own
+// instead of staying dead until someone notices.
+func (r *MailAccountRepository) FindStale(db *gorm.DB, before int64, limit int) ([]entity.MailAccount, error) {
+	var accounts []entity.MailAccount
+	err := db.Where("status <> ? AND (last_verified_at IS NULL OR last_verified_at < ?)",
+		entity.MailAccountStatusDisabled, before).
+		Order("last_verified_at ASC NULLS FIRST").
+		Limit(limit).
+		Clauses(lockSkipLocked()).
+		Find(&accounts).Error
+	return accounts, err
+}
+
 func (r *MailAccountRepository) CountByStatus(db *gorm.DB) (map[string]int64, error) {
 	return countByColumn(db, &entity.MailAccount{}, "status")
 }
