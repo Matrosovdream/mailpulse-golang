@@ -121,7 +121,7 @@ func (c *MailAccountUseCase) Create(ctx context.Context, request *model.CreateMa
 		return nil, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "mail_account.created",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "mail_account.created",
 		EntityType: "mail_accounts", EntityID: &account.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -340,7 +340,7 @@ func (c *MailAccountUseCase) Update(ctx context.Context, request *model.UpdateMa
 		return nil, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "mail_account.updated",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "mail_account.updated",
 		EntityType: "mail_accounts", EntityID: &account.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -374,7 +374,7 @@ func (c *MailAccountUseCase) Delete(ctx context.Context, request *model.GetMailA
 		return false, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "mail_account.deleted",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "mail_account.deleted",
 		EntityType: "mail_accounts", EntityID: &account.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -426,7 +426,7 @@ func (c *MailAccountUseCase) Verify(ctx context.Context, request *model.GetMailA
 		return nil, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "mail_account.verified",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "mail_account.verified",
 		EntityType: "mail_accounts", EntityID: &account.ID})
 
 	if err := tx.Commit().Error; err != nil {

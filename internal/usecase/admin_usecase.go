@@ -154,7 +154,7 @@ func (c *AdminUseCase) UpdateUser(ctx context.Context, request *model.UpdateAdmi
 		rolesChanged = true
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.ActorID, Action: "admin.user.updated",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.ActorID, Action: "admin.user.updated",
 		EntityType: "users", EntityID: &user.ID, Metadata: map[string]any{"roles": request.Roles}})
 
 	if err := tx.Commit().Error; err != nil {
@@ -197,7 +197,7 @@ func (c *AdminUseCase) SetUserStatus(ctx context.Context, request *model.SetAdmi
 		paused = count
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.ActorID, Action: "admin.user." + request.Status,
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.ActorID, Action: "admin.user." + request.Status,
 		EntityType: "users", EntityID: &user.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -223,6 +223,14 @@ func (c *AdminUseCase) Impersonate(ctx context.Context, request *model.Impersona
 		return nil, fiber.NewError(fiber.StatusBadRequest, "you are already signed in as that user")
 	}
 
+	// Impersonating onwards from an impersonated session would make the audit
+	// trail name the wrong admin: the session only records one impersonator, so
+	// a chain collapses to whoever was impersonated last.
+	if auth := model.AuthFromContext(ctx); auth != nil && auth.Impersonated {
+		return nil, fiber.NewError(fiber.StatusForbidden,
+			"end the current impersonation session before starting another")
+	}
+
 	tx := c.DB.WithContext(ctx).Begin()
 	defer tx.Rollback()
 
@@ -240,13 +248,16 @@ func (c *AdminUseCase) Impersonate(ctx context.Context, request *model.Impersona
 		return nil, err
 	}
 
-	// impersonation sessions are deliberately short
+	// impersonation sessions are deliberately short, and are marked so that
+	// Verify can tell them apart from the target user's own logins — without
+	// the mark every action taken here is attributed to the target
 	session.ExpiresAt = time.Now().Add(30 * time.Minute).UnixMilli()
+	session.ImpersonatedBy = &request.ActorID
 	if err := c.Sessions.Update(tx, session); err != nil {
 		return nil, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{
+	c.Audit.Record(ctx, tx, AuditEntry{
 		ActorID:            &request.ActorID,
 		ImpersonatedUserID: &user.ID,
 		Action:             "admin.user.impersonated",

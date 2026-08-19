@@ -34,6 +34,11 @@ func NewAuth(userUseCase *usecase.UserUseCase) fiber.Handler {
 
 		ctx.Locals(authLocalsKey, auth)
 		ctx.Locals(tokenLocalsKey, token)
+
+		// also carried on the context the usecases receive, so audit writes can
+		// see who is really acting without 26 call sites passing it by hand
+		ctx.SetUserContext(model.ContextWithAuth(ctx.UserContext(), auth))
+
 		return ctx.Next()
 	}
 }
@@ -48,8 +53,8 @@ func GetUser(ctx *fiber.Ctx) *model.Auth {
 	return auth
 }
 
-// GetToken returns the raw bearer token, which logout needs in order to evict
-// the cache entry keyed by it.
+// GetToken returns the raw bearer token, which logout needs in order to derive
+// the hash the cache entry is keyed by.
 func GetToken(ctx *fiber.Ctx) string {
 	token, _ := ctx.Locals(tokenLocalsKey).(string)
 	return token

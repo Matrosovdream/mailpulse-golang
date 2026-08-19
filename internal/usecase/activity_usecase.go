@@ -221,7 +221,7 @@ func (c *ActivityUseCase) Cancel(ctx context.Context, request *model.EventRunAct
 		return nil, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "event_run.cancelled",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "event_run.cancelled",
 		EntityType: "event_runs", EntityID: &run.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -257,7 +257,7 @@ func (c *ActivityUseCase) Ack(ctx context.Context, request *model.EventRunAction
 		}
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "event_run.acknowledged",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "event_run.acknowledged",
 		EntityType: "event_runs", EntityID: &run.ID})
 
 	if err := tx.Commit().Error; err != nil {

@@ -19,13 +19,24 @@ func UserToResponse(user *entity.User) *model.UserResponse {
 	}
 }
 
-func UserToAuth(user *entity.User, sessionID string) *model.Auth {
-	return &model.Auth{
+// UserToAuth builds the value the auth middleware puts on the request. On an
+// impersonated session the identity stays the target user — ownership checks
+// must keep scoping to their data — and the admin is carried alongside so the
+// audit trail can name the human actually responsible.
+func UserToAuth(user *entity.User, sessionID string, impersonatedBy *string) *model.Auth {
+	auth := &model.Auth{
 		ID:        user.ID,
 		Email:     user.Email,
 		Roles:     user.RoleSlugs(),
 		SessionID: sessionID,
 	}
+
+	if impersonatedBy != nil && *impersonatedBy != "" {
+		auth.Impersonated = true
+		auth.ImpersonatedBy = *impersonatedBy
+	}
+
+	return auth
 }
 
 func SessionToResponse(session *entity.UserSession, currentID string) *model.SessionResponse {

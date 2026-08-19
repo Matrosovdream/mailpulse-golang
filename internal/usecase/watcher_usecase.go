@@ -106,7 +106,7 @@ func (c *WatcherUseCase) Create(ctx context.Context, request *model.CreateWatche
 		}
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "watcher.created",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "watcher.created",
 		EntityType: "watchers", EntityID: &watcher.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -265,7 +265,7 @@ func (c *WatcherUseCase) Update(ctx context.Context, request *model.UpdateWatche
 		return nil, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "watcher.updated",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "watcher.updated",
 		EntityType: "watchers", EntityID: &watcher.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -289,7 +289,7 @@ func (c *WatcherUseCase) Delete(ctx context.Context, request *model.GetWatcherRe
 		return false, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "watcher.deleted",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "watcher.deleted",
 		EntityType: "watchers", EntityID: &watcher.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -324,7 +324,7 @@ func (c *WatcherUseCase) SetStatus(ctx context.Context, request *model.SetWatche
 		return nil, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "watcher." + request.Status,
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "watcher." + request.Status,
 		EntityType: "watchers", EntityID: &watcher.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -379,7 +379,7 @@ func (c *WatcherUseCase) ReplaceFilters(ctx context.Context, request *model.Repl
 		return nil, err
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "watcher.filters_replaced",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "watcher.filters_replaced",
 		EntityType: "watchers", EntityID: &watcher.ID})
 
 	if err := tx.Commit().Error; err != nil {

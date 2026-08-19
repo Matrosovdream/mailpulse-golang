@@ -74,7 +74,7 @@ func (c *WatcherEventUseCase) Create(ctx context.Context, request *model.CreateW
 		return nil, err
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "watcher_event.created",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "watcher_event.created",
 		EntityType: "watcher_events", EntityID: &created.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -300,7 +300,7 @@ func (c *WatcherEventUseCase) Update(ctx context.Context, request *model.UpdateW
 		}
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "watcher_event.updated",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "watcher_event.updated",
 		EntityType: "watcher_events", EntityID: &watcherEvent.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -334,7 +334,7 @@ func (c *WatcherEventUseCase) Delete(ctx context.Context, request *model.GetWatc
 		return false, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "watcher_event.deleted",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "watcher_event.deleted",
 		EntityType: "watcher_events", EntityID: &watcherEvent.ID})
 
 	if err := tx.Commit().Error; err != nil {

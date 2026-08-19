@@ -109,7 +109,7 @@ func (c *NotifierUseCase) Create(ctx context.Context, request *model.CreateNotif
 		}
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "notifier.created",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "notifier.created",
 		EntityType: "notifiers", EntityID: &notifier.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -216,7 +216,7 @@ func (c *NotifierUseCase) Update(ctx context.Context, request *model.UpdateNotif
 		}
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "notifier.updated",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "notifier.updated",
 		EntityType: "notifiers", EntityID: &notifier.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -250,7 +250,7 @@ func (c *NotifierUseCase) Delete(ctx context.Context, request *model.GetNotifier
 		return false, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "notifier.deleted",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "notifier.deleted",
 		EntityType: "notifiers", EntityID: &notifier.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -331,7 +331,7 @@ func (c *NotifierUseCase) Verify(ctx context.Context, request *model.VerifyNotif
 		return nil, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &request.UserID, Action: "notifier.verified",
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &request.UserID, Action: "notifier.verified",
 		EntityType: "notifiers", EntityID: &notifier.ID})
 
 	if err := tx.Commit().Error; err != nil {
@@ -412,7 +412,7 @@ func (c *NotifierUseCase) HandleTelegramUpdate(ctx context.Context, request *mod
 		return false, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{Action: "notifier.verified_via_telegram",
+	c.Audit.Record(ctx, tx, AuditEntry{Action: "notifier.verified_via_telegram",
 		EntityType: "notifiers", EntityID: &notifier.ID})
 
 	if err := tx.Commit().Error; err != nil {

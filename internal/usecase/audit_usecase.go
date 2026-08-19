@@ -43,7 +43,13 @@ func NewAuditUseCase(db *gorm.DB, log *logrus.Logger, validate *validator.Valida
 // Record writes inside the caller's transaction so the audit row lives or dies
 // with the change it describes. A failure is logged, never returned: losing an
 // audit line must not roll back the user's actual work.
-func (c *AuditUseCase) Record(tx *gorm.DB, entry AuditEntry) {
+//
+// ctx is here for attribution, not cancellation: it carries the Auth that the
+// middleware resolved, which is the only place that knows an impersonated
+// session from an ordinary one.
+func (c *AuditUseCase) Record(ctx context.Context, tx *gorm.DB, entry AuditEntry) {
+	c.attribute(ctx, &entry)
+
 	metadata := entity.JSON("{}")
 	if entry.Metadata != nil {
 		if raw, err := json.Marshal(entry.Metadata); err == nil {
@@ -66,6 +72,33 @@ func (c *AuditUseCase) Record(tx *gorm.DB, entry AuditEntry) {
 	if err := c.Logs.Create(tx, record); err != nil {
 		c.Log.WithError(err).Warnf("Failed to write audit log for %s", entry.Action)
 	}
+}
+
+// attribute rewrites an entry recorded during impersonation so the row names
+// the admin who is really acting, with the target in impersonated_user_id.
+//
+// This lives in one place on purpose. The alternative — passing the pair in at
+// each of the two dozen Record calls — is the arrangement that produced the
+// original bug, where a session issued by _impersonate wrote audit rows
+// indistinguishable from the target user's own.
+//
+// An entry that already sets ImpersonatedUserID is left alone: that is the
+// _impersonate event itself, which is recorded by the admin's own session and
+// already names both parties.
+func (c *AuditUseCase) attribute(ctx context.Context, entry *AuditEntry) {
+	if entry.ImpersonatedUserID != nil {
+		return
+	}
+
+	auth := model.AuthFromContext(ctx)
+	if auth == nil || !auth.Impersonated || auth.ImpersonatedBy == "" {
+		return
+	}
+
+	actor := auth.ImpersonatedBy
+	target := auth.ID
+	entry.ActorID = &actor
+	entry.ImpersonatedUserID = &target
 }
 
 func (c *AuditUseCase) List(ctx context.Context, request *model.ListAuditLogRequest) ([]model.AuditLogResponse, *model.PageMetadata, error) {

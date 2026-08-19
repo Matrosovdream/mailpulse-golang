@@ -32,10 +32,13 @@ func queryMillis(ctx *fiber.Ctx, key string) int64 {
 	return value
 }
 
-// clientIP prefers the proxy header, since the app is meant to run behind one.
+// clientIP is the address recorded on audit rows and sessions.
+//
+// It defers to Fiber, which reads X-Forwarded-For only when the connection came
+// from an address in WEB_TRUSTED_PROXIES and otherwise reports the peer. Taking
+// the header at face value, as this used to, meant any caller could write an
+// arbitrary IP into the audit trail simply by setting it — which is worse than
+// recording nothing, because the value reads as evidence.
 func clientIP(ctx *fiber.Ctx) string {
-	if forwarded := ctx.Get("X-Forwarded-For"); forwarded != "" {
-		return forwarded
-	}
 	return ctx.IP()
 }
