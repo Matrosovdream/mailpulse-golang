@@ -144,6 +144,23 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  # a real IMAP + SMTP server to develop against, so the mail client is
+  # exercised for real without pointing at anyone's actual mailbox.
+  # users are created on the fly by GREENMAIL_OPTS below.
+  greenmail:
+    image: greenmail/standalone:2.1.0
+    environment:
+      # auth.disabled is deliberately NOT set: it makes GreenMail auto-create
+      # users on login, which then collides with the ones declared here
+      GREENMAIL_OPTS: >-
+        -Dgreenmail.setup.test.all
+        -Dgreenmail.hostname=0.0.0.0
+        -Dgreenmail.users=demo:secret123@corp.com,ops:secret123@corp.com
+    ports:
+      - "${GREENMAIL_IMAP_PORT:-3143}:3143"
+      - "${GREENMAIL_SMTP_PORT:-3025}:3025"
+    restart: unless-stopped
+
   adminer:
     image: adminer:4
     environment:

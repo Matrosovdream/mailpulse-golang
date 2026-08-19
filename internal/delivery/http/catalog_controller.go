@@ -19,6 +19,17 @@ func NewCatalogController(useCase *usecase.CatalogUseCase, log *logrus.Logger) *
 	return &CatalogController{Log: log, UseCase: useCase}
 }
 
+// MailProviderTypes drives the connect form: which mailboxes a user may add,
+// the host/port preset for each, and what that client can do.
+func (c *CatalogController) MailProviderTypes(ctx *fiber.Ctx) error {
+	response, err := c.UseCase.MailProviderTypes(ctx.UserContext())
+	if err != nil {
+		return err
+	}
+
+	return ctx.JSON(model.WebResponse[[]model.MailProviderResponse]{Data: response})
+}
+
 func (c *CatalogController) EventTypes(ctx *fiber.Ctx) error {
 	return ctx.JSON(model.WebResponse[[]model.EventTypeResponse]{Data: c.UseCase.EventTypes()})
 }

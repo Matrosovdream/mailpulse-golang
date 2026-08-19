@@ -25,6 +25,10 @@ type RouteConfig struct {
 	CatalogController      *http.CatalogController
 
 	AuthMiddleware fiber.Handler
+
+	// applied to the unauthenticated credential endpoints; see SetupPublicRoute
+	LoginRateLimit          fiber.Handler
+	ForgotPasswordRateLimit fiber.Handler
 }
 
 func (c *RouteConfig) Setup() {
@@ -38,8 +42,12 @@ func (c *RouteConfig) SetupPublicRoute() {
 	c.App.Get("/api/health", c.CatalogController.Health)
 
 	c.App.Post("/api/users", c.UserController.Register)
-	c.App.Post("/api/users/_login", c.UserController.Login)
-	c.App.Post("/api/users/_forgot-password", c.UserController.ForgotPassword)
+
+	// the two endpoints that accept or act on credentials without a session,
+	// and so are the ones worth guessing against
+	c.App.Post("/api/users/_login", c.LoginRateLimit, c.UserController.Login)
+	c.App.Post("/api/users/_forgot-password", c.ForgotPasswordRateLimit, c.UserController.ForgotPassword)
+
 	c.App.Post("/api/users/_reset-password", c.UserController.ResetPassword)
 
 	// provider callbacks: authenticated by their own state or secret token,
@@ -60,6 +68,7 @@ func (c *RouteConfig) SetupAuthRoute() {
 	api.Delete("/users/_sessions/:sessionId", c.UserController.RevokeSession)
 
 	// ---- catalogs that drive the SPA's dynamic forms
+	api.Get("/mail-provider-types", c.CatalogController.MailProviderTypes)
 	api.Get("/event-types", c.CatalogController.EventTypes)
 	api.Get("/notifier-types", c.CatalogController.NotifierTypes)
 	api.Get("/filter-fields", c.CatalogController.FilterFields)

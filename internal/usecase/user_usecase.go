@@ -52,6 +52,11 @@ func NewUserUseCase(db *gorm.DB, log *logrus.Logger, validate *validator.Validat
 
 // hashToken keeps the bearer token out of the database: a dump gives an
 // attacker hashes, not usable sessions.
+//
+// The redis cache is keyed by the same hash. That is what makes revocation
+// possible at all — a session row stores only the hash, so keying the cache by
+// the raw token left no way to find the entry to evict. It also stops a redis
+// dump from handing over usable bearer tokens as key names.
 func hashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
@@ -64,7 +69,9 @@ func (c *UserUseCase) Verify(ctx context.Context, request *model.VerifyUserReque
 		return nil, fiber.ErrUnauthorized
 	}
 
-	if auth, err := c.UserCache.Get(ctx, request.Token); err == nil && auth != nil {
+	tokenHash := hashToken(request.Token)
+
+	if auth, err := c.UserCache.Get(ctx, tokenHash); err == nil && auth != nil {
 		return auth, nil
 	}
 
@@ -74,7 +81,7 @@ func (c *UserUseCase) Verify(ctx context.Context, request *model.VerifyUserReque
 	now := time.Now().UnixMilli()
 
 	session := new(entity.UserSession)
-	if err := c.Sessions.FindActiveByTokenHash(tx, session, hashToken(request.Token), now); err != nil {
+	if err := c.Sessions.FindActiveByTokenHash(tx, session, tokenHash, now); err != nil {
 		c.Log.Warnf("No active session for token : %+v", err)
 		return nil, fiber.ErrUnauthorized
 	}
@@ -104,8 +111,8 @@ func (c *UserUseCase) Verify(ctx context.Context, request *model.VerifyUserReque
 		return nil, fiber.ErrInternalServerError
 	}
 
-	auth := converter.UserToAuth(user, session.ID)
-	if err := c.UserCache.Set(ctx, request.Token, auth); err != nil {
+	auth := converter.UserToAuth(user, session.ID, session.ImpersonatedBy)
+	if err := c.UserCache.Set(ctx, tokenHash, auth); err != nil {
 		c.Log.Warnf("Failed cache auth token : %+v", err)
 	}
 
@@ -113,6 +120,11 @@ func (c *UserUseCase) Verify(ctx context.Context, request *model.VerifyUserReque
 }
 
 func (c *UserUseCase) Create(ctx context.Context, request *model.RegisterUserRequest) (*model.UserResponse, error) {
+	// normalise before validating: a pasted address often carries surrounding
+	// whitespace, and the email rule would reject it before the trim below
+	// ever ran
+	request.Email = strings.ToLower(strings.TrimSpace(request.Email))
+
 	if err := c.Validate.Struct(request); err != nil {
 		c.Log.Warnf("Invalid register request : %+v", err)
 		return nil, fiber.ErrBadRequest
@@ -121,7 +133,7 @@ func (c *UserUseCase) Create(ctx context.Context, request *model.RegisterUserReq
 	tx := c.DB.WithContext(ctx).Begin()
 	defer tx.Rollback()
 
-	email := strings.ToLower(strings.TrimSpace(request.Email))
+	email := request.Email
 
 	total, err := c.Users.CountByEmail(tx, email)
 	if err != nil {
@@ -170,7 +182,7 @@ func (c *UserUseCase) Create(ctx context.Context, request *model.RegisterUserReq
 	}
 	user.Roles = []entity.Role{*role}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &user.ID, Action: "user.registered", EntityType: "users", EntityID: &user.ID})
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &user.ID, Action: "user.registered", EntityType: "users", EntityID: &user.ID})
 
 	if err := tx.Commit().Error; err != nil {
 		c.Log.Warnf("Failed commit transaction : %+v", err)
@@ -183,6 +195,8 @@ func (c *UserUseCase) Create(ctx context.Context, request *model.RegisterUserReq
 }
 
 func (c *UserUseCase) Login(ctx context.Context, request *model.LoginUserRequest) (*model.LoginResponse, error) {
+	request.Email = strings.ToLower(strings.TrimSpace(request.Email))
+
 	if err := c.Validate.Struct(request); err != nil {
 		c.Log.Warnf("Invalid login request : %+v", err)
 		return nil, fiber.ErrBadRequest
@@ -192,7 +206,7 @@ func (c *UserUseCase) Login(ctx context.Context, request *model.LoginUserRequest
 	defer tx.Rollback()
 
 	user := new(entity.User)
-	if err := c.Users.FindByEmail(tx, user, strings.ToLower(strings.TrimSpace(request.Email))); err != nil {
+	if err := c.Users.FindByEmail(tx, user, request.Email); err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			// same error and roughly the same cost as a wrong password, so the
 			// response does not reveal which addresses are registered
@@ -221,7 +235,7 @@ func (c *UserUseCase) Login(ctx context.Context, request *model.LoginUserRequest
 		return nil, err
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &user.ID, Action: "user.logged_in", EntityType: "user_sessions", EntityID: &session.ID, IP: nilIfEmpty(request.IP)})
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &user.ID, Action: "user.logged_in", EntityType: "user_sessions", EntityID: &session.ID, IP: nilIfEmpty(request.IP)})
 
 	if err := tx.Commit().Error; err != nil {
 		c.Log.Warnf("Failed commit transaction : %+v", err)
@@ -320,7 +334,7 @@ func (c *UserUseCase) Update(ctx context.Context, request *model.UpdateUserReque
 		return nil, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &user.ID, Action: "user.updated", EntityType: "users", EntityID: &user.ID})
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &user.ID, Action: "user.updated", EntityType: "users", EntityID: &user.ID})
 
 	if err := tx.Commit().Error; err != nil {
 		return nil, fiber.ErrInternalServerError
@@ -355,7 +369,7 @@ func (c *UserUseCase) Logout(ctx context.Context, request *model.LogoutUserReque
 
 	// without this the revoked token keeps authenticating until the TTL lapses
 	if request.Token != "" {
-		if err := c.UserCache.Delete(ctx, request.Token); err != nil {
+		if err := c.UserCache.Delete(ctx, hashToken(request.Token)); err != nil {
 			c.Log.Warnf("Failed evict auth token : %+v", err)
 		}
 	}
@@ -398,18 +412,24 @@ func (c *UserUseCase) RevokeSession(ctx context.Context, request *model.RevokeSe
 		return false, fiber.ErrInternalServerError
 	}
 
-	// the raw token is not recoverable from the hash, so the cached entry is
-	// left to expire; it is bounded by REDIS_TTL_AUTH
+	// the session row carries the same hash the cache is keyed by, so revoking
+	// another device takes effect immediately rather than at the end of the TTL
+	if err := c.UserCache.Delete(ctx, session.TokenHash); err != nil {
+		c.Log.Warnf("Failed evict revoked session %s : %+v", session.ID, err)
+	}
+
 	return true, nil
 }
 
 func (c *UserUseCase) ForgotPassword(ctx context.Context, request *model.ForgotPasswordRequest) (bool, error) {
+	request.Email = strings.ToLower(strings.TrimSpace(request.Email))
+
 	if err := c.Validate.Struct(request); err != nil {
 		return false, fiber.ErrBadRequest
 	}
 
 	user := new(entity.User)
-	err := c.Users.FindByEmail(c.DB.WithContext(ctx), user, strings.ToLower(strings.TrimSpace(request.Email)))
+	err := c.Users.FindByEmail(c.DB.WithContext(ctx), user, request.Email)
 	if err != nil {
 		// always report success: whether an address is registered is not
 		// something an unauthenticated caller should be able to probe
@@ -458,7 +478,7 @@ func (c *UserUseCase) ResetPassword(ctx context.Context, request *model.ResetPas
 		return false, fiber.ErrInternalServerError
 	}
 
-	c.Audit.Record(tx, AuditEntry{ActorID: &user.ID, Action: "user.password_reset", EntityType: "users", EntityID: &user.ID})
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &user.ID, Action: "user.password_reset", EntityType: "users", EntityID: &user.ID})
 
 	if err := tx.Commit().Error; err != nil {
 		return false, fiber.ErrInternalServerError
@@ -471,11 +491,18 @@ func (c *UserUseCase) ResetPassword(ctx context.Context, request *model.ResetPas
 	return true, nil
 }
 
-// revokeAllSessions is used whenever a credential changes.
+// revokeAllSessions is used whenever a credential changes. The returned hashes
+// are the cache keys: revoking in the database alone would leave every one of
+// those sessions authenticating from cache until REDIS_TTL_AUTH lapsed.
 func (c *UserUseCase) revokeAllSessions(ctx context.Context, userID string) {
-	_, err := c.Sessions.RevokeAllForUser(c.DB.WithContext(ctx), userID, time.Now().UnixMilli())
+	hashes, err := c.Sessions.RevokeAllForUser(c.DB.WithContext(ctx), userID, time.Now().UnixMilli())
 	if err != nil {
 		c.Log.Warnf("Failed revoke sessions for %s : %+v", userID, err)
+		return
+	}
+
+	if err := c.UserCache.Delete(ctx, hashes...); err != nil {
+		c.Log.Warnf("Failed evict sessions for %s : %+v", userID, err)
 	}
 }
 

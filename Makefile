@@ -59,10 +59,44 @@ migrate-create: ## Create a migration pair: make migrate-create name=add_somethi
 	$(DC) run --rm --entrypoint migrate migrate \
 		create -ext sql -dir /migrations -format 20060102150405 $(name)
 
+# ---------------------------------------------------------------- seeds
+.PHONY: seed
+seed: ## Seed the dev database from db/seeds
+	$(DC) exec -T web go run ./cmd/seeder
+
+.PHONY: seed-only
+seed-only: ## Seed one table: make seed-only name=users
+	@test -n "$(name)" || (echo "usage: make seed-only name=users" && exit 1)
+	$(DC) exec -T web go run ./cmd/seeder -only=$(name)
+
+.PHONY: seed-list
+seed-list: ## List the registered seeders and the files they read
+	$(DC) exec -T web go run ./cmd/seeder -list
+
 # ---------------------------------------------------------------- go
+# Tests are split by what they need to run:
+#   unit         nothing. pure functions, runs anywhere including CI
+#   integration  postgres + redis. repositories, seeders, gateways
+#   feature      the whole app over HTTP, plus a mail server
+# Build tags keep them apart so `go test ./...` never needs infrastructure.
 .PHONY: test
-test: ## Run the integration tests against the dev stack
-	$(DC) exec web go test ./test/... -v
+test: test-unit test-integration test-feature ## Run every test layer
+
+.PHONY: test-unit
+test-unit: ## Unit tests only, no infrastructure needed
+	go test ./internal/... $(ARGS)
+
+.PHONY: test-integration
+test-integration: ## Repository and seeder tests against the dev database
+	$(DC) exec -T web go test -tags=integration -count=1 ./test/integration/... $(ARGS)
+
+.PHONY: test-feature
+test-feature: ## Endpoint tests through the whole app
+	$(DC) exec -T web go test -tags=feature -count=1 ./test/feature/... $(ARGS)
+
+.PHONY: test-verbose
+test-verbose: ## Every layer with per-test output
+	$(MAKE) test ARGS=-v
 
 .PHONY: build
 build: ## Compile both binaries locally

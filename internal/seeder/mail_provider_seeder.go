@@ -9,6 +9,7 @@ import (
 	"mailpulse/internal/entity"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // MailProviderSeed is one row of db/seeds/mail_providers.json.
@@ -69,10 +70,16 @@ func (s *MailProviderSeeder) Seed(ctx context.Context, db *gorm.DB, raw json.Raw
 
 		switch {
 		case errors.Is(err, gorm.ErrRecordNotFound):
-			if createErr := db.Create(&row).Error; createErr != nil {
-				return result, createErr
+			// a concurrent seeder may have inserted this slug since the SELECT
+			insert := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
+			if insert.Error != nil {
+				return result, insert.Error
 			}
-			result.Created++
+			if insert.RowsAffected == 0 {
+				result.Skipped++
+			} else {
+				result.Created++
+			}
 
 		case err != nil:
 			return result, err

@@ -3,4 +3,10 @@
 *.exe
 bin/
 dist/
+tmp/
 config.local.json
+
+# secrets: only the example is committed
+.env
+.env.*
+!.env.example

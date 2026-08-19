@@ -1,22 +1,24 @@
 package converter
 
 import (
+	"encoding/json"
+
 	"mailpulse/internal/entity"
 	"mailpulse/internal/model"
 )
 
 // MailAccountToResponse deliberately drops credentials and sync_state: one is
-// secret, the other is provider bookkeeping the SPA has no use for.
+// secret, the other is provider bookkeeping the SPA has no use for. Settings
+// is returned because the connect form needs to render what is stored.
 func MailAccountToResponse(account *entity.MailAccount) *model.MailAccountResponse {
 	return &model.MailAccountResponse{
 		ID:                  account.ID,
 		Provider:            account.Provider,
 		EmailAddress:        account.EmailAddress,
 		DisplayName:         account.DisplayName,
-		AuthType:            account.AuthType,
-		ImapHost:            account.ImapHost,
-		ImapPort:            account.ImapPort,
-		ImapUseTLS:          account.ImapUseTLS,
+		AuthMode:            account.AuthMode,
+		Settings:            json.RawMessage(entity.JSONOrEmpty(account.Settings, "{}")),
+		TokenExpiresAt:      account.TokenExpiresAt,
 		Status:              account.Status,
 		LastVerifiedAt:      account.LastVerifiedAt,
 		LastError:           account.LastError,

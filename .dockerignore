@@ -1,0 +1,25 @@
+.git
+.gitignore
+.github
+
+# secrets and local overrides never belong in an image
+.env
+.env.*
+!.env.example
+config.local.json
+
+# build output
+tmp/
+bin/
+dist/
+
+# editor and agent state
+.idea/
+.vscode/
+.claude/
+
+# docs and compose files are not needed at build time
+*.md
+docker-compose*.yml
+Dockerfile
+.dockerignore

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+
 	"mailpulse/internal/config"
 )
 
@@ -25,8 +26,7 @@ func main() {
 	})
 
 	webPort := viperConfig.GetInt("web.port")
-	err := app.Listen(fmt.Sprintf(":%d", webPort))
-	if err != nil {
+	if err := app.Listen(fmt.Sprintf(":%d", webPort)); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }

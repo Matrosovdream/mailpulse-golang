@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // UserSeed is one row of db/seeds/users.json.
@@ -82,15 +83,32 @@ func (s *UserSeeder) Seed(ctx context.Context, db *gorm.DB, raw json.RawMessage)
 				Timezone: orDefault(seed.Timezone, "UTC"),
 			}
 
-			if createErr := db.Create(user).Error; createErr != nil {
-				return result, createErr
+			// The SELECT above is a hint, not a lock: two seeder processes can
+			// both reach here for the same address. Letting the unique index
+			// decide makes the loser a no-op instead of a crash.
+			insert := db.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "email"}},
+				DoNothing: true,
+			}).Create(user)
+			if insert.Error != nil {
+				return result, insert.Error
+			}
+
+			if insert.RowsAffected == 0 {
+				// someone else won the race; adopt their row so the roles below
+				// attach to the user that actually exists
+				if findErr := db.Where("email = ?", email).Take(existing).Error; findErr != nil {
+					return result, findErr
+				}
+				user.ID = existing.ID
+				result.Skipped++
+			} else {
+				result.Created++
 			}
 
 			if _, roleErr := s.syncRoles(db, user.ID, seed.Roles); roleErr != nil {
 				return result, roleErr
 			}
-
-			result.Created++
 
 		default:
 			return result, err
@@ -126,10 +144,16 @@ func (s *UserSeeder) syncRoles(db *gorm.DB, userID string, slugs []string) (bool
 			continue
 		}
 
-		if err := db.Create(&entity.UserRole{UserID: userID, RoleID: role.ID}).Error; err != nil {
-			return changed, err
+		// same reasoning as the user insert: the composite primary key is the
+		// real guard, the count above is only an optimisation
+		link := db.Clauses(clause.OnConflict{DoNothing: true}).
+			Create(&entity.UserRole{UserID: userID, RoleID: role.ID})
+		if link.Error != nil {
+			return changed, link.Error
 		}
-		changed = true
+		if link.RowsAffected > 0 {
+			changed = true
+		}
 	}
 
 	return changed, nil
