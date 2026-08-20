@@ -23,18 +23,39 @@ type RouteConfig struct {
 	ActivityController     *http.ActivityController
 	AdminController        *http.AdminController
 	CatalogController      *http.CatalogController
+	DocsController         *http.DocsController
 
 	AuthMiddleware fiber.Handler
 
 	// applied to the unauthenticated credential endpoints; see SetupPublicRoute
 	LoginRateLimit          fiber.Handler
 	ForgotPasswordRateLimit fiber.Handler
+
+	// when false the docs routes are not registered at all; see SetupDocsRoute
+	DocsEnabled bool
 }
 
 func (c *RouteConfig) Setup() {
 	c.SetupPublicRoute()
+	c.SetupDocsRoute()
 	c.SetupAuthRoute()
 	c.SetupAdminRoute()
+}
+
+// SetupDocsRoute mounts the OpenAPI description and its Swagger UI, both public.
+//
+// It runs before SetupAuthRoute so these two paths are matched before the /api
+// group's auth middleware can claim them. When docs are disabled the routes are
+// never registered, and both paths then fall through to that group and answer
+// 401 like any other unmatched path under /api — which is what keeps a disabled
+// instance from confirming that a docs route exists here.
+func (c *RouteConfig) SetupDocsRoute() {
+	if !c.DocsEnabled {
+		return
+	}
+
+	c.App.Get("/api/openapi.yaml", c.DocsController.Spec)
+	c.App.Get("/api/docs", c.DocsController.UI)
 }
 
 // SetupPublicRoute is everything reachable without a token.

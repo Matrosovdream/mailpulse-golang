@@ -52,6 +52,11 @@ func setDefaults(config *viper.Viper) {
 	// default: trusting the header unconditionally lets any caller claim any IP
 	// and defeats both the rate limiter and the audit trail.
 	config.SetDefault("web.trusted_proxies", "")
+	// serves GET /api/docs and GET /api/openapi.yaml, both unauthenticated.
+	// On by default because the description is how the API is meant to be read;
+	// turn it off where naming every endpoint to an anonymous caller is not
+	// wanted, and the two routes are not registered at all.
+	config.SetDefault("web.docs_enabled", true)
 
 	// there is deliberately no default encryption key: a shipped one reads as
 	// protection while providing none, so an unset key stops the app instead

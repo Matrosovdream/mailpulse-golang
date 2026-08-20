@@ -4,8 +4,10 @@ tmp_dir = "tmp"
 [build]
   cmd = "go build -o ./tmp/web ./cmd/web"
   bin = "./tmp/web"
-  include_ext = ["go", "json"]
-  exclude_dir = ["tmp", "bin", "dist", "db", "api", ".git", ".claude"]
+  # yaml is watched because api/openapi.yaml is embedded into the binary, so
+  # editing the API description has to trigger a rebuild to be served
+  include_ext = ["go", "json", "yaml"]
+  exclude_dir = ["tmp", "bin", "dist", "db", ".git", ".claude"]
   exclude_regex = ["_test\\.go"]
   delay = 300
   stop_on_error = true

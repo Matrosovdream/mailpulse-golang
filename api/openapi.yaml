@@ -1,0 +1,3379 @@
+openapi: 3.1.0
+
+info:
+  title: MailPulse API
+  version: 1.0.0
+  summary: Watch mailboxes, match messages against filters, and fire events when they match.
+  description: |
+    MailPulse connects mail accounts over IMAP (or OAuth, per provider), runs each
+    incoming message against a watcher's filters, and dispatches the watcher's
+    events — notifications, webhooks, HTTP requests — when a message matches.
+
+    ## Response envelope
+
+    Every JSON response is wrapped in the same envelope (`model.WebResponse[T]`):
+
+    ```json
+    { "data": <payload>, "paging": { ... }, "errors": "..." }
+    ```
+
+    `paging` appears only on paginated list endpoints. `errors` appears only on
+    failures, and is the sole field on an error response — the error handler in
+    `internal/config/fiber.go` emits `{"errors": "<message>"}` with the matching
+    HTTP status. `data` is absent on errors.
+
+    ## Timestamps
+
+    Every timestamp in this API is an integer count of **milliseconds since the
+    Unix epoch**, never an RFC 3339 string. The `from` and `to` filters on list
+    endpoints take the same unit.
+
+    ## Authentication
+
+    Send the session token from `POST /api/users/_login` as a bearer token:
+
+    ```
+    Authorization: Bearer <token>
+    ```
+
+    The auth middleware also accepts the bare token with no `Bearer ` prefix.
+    Tokens are cached in Redis against their hash; revoking a session or changing
+    a user's roles evicts the cached entry immediately.
+
+    ## Configuration-driven forms
+
+    The catalog endpoints (`/api/mail-provider-types`, `/api/event-types`,
+    `/api/notifier-types`, `/api/filter-fields`) return a `config_schema` that
+    describes each plug-in's fields. Clients render the connect, event and
+    notifier forms from those schemas rather than hard-coding them, so adding a
+    provider or handler on the server needs no client release.
+  contact:
+    name: MailPulse
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: '{scheme}://{host}'
+    description: Deployment
+    variables:
+      scheme:
+        default: https
+        enum: [https, http]
+      host:
+        default: api.example.com
+
+tags:
+  - name: Health
+    description: Liveness and dependency status.
+  - name: Auth
+    description: Registration, login, and password recovery. Unauthenticated.
+  - name: Account
+    description: The signed-in user's own profile and active sessions.
+  - name: Catalog
+    description: Registry-driven descriptors that let a client render its forms from the server's capabilities.
+  - name: Mail Accounts
+    description: Connected mailboxes, their credentials, verification and sync history.
+  - name: Notifiers
+    description: Delivery channels — Telegram, Slack, Discord, SMS, email, webhook.
+  - name: Watchers
+    description: Rules that match incoming mail on a connected account.
+  - name: Watcher Filters
+    description: The match conditions on a watcher, edited as a complete set.
+  - name: Watcher Events
+    description: The ordered actions a watcher fires when a message matches.
+  - name: Activity
+    description: Matched emails, event runs, deliveries, and the dashboard rollup.
+  - name: Admin
+    description: Superadmin-only. Requires the `superadmin` role.
+  - name: Webhooks
+    description: Endpoints called by third parties, authenticated by their own payload rather than a session.
+
+security:
+  - bearerAuth: []
+
+paths:
+  # ------------------------------------------------------------------ health
+  /api/health:
+    get:
+      tags: [Health]
+      summary: Service health
+      description: |
+        Reports each dependency separately so the answer says which one is down.
+        Returns `503` when the database or Redis is unreachable; Kafka being
+        down does not by itself fail the check, because the producer is
+        optional and the web tier serves requests without it.
+      operationId: health
+      security: []
+      responses:
+        '200':
+          description: Every required dependency is reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/HealthResponse'
+              example:
+                data:
+                  database: ok
+                  redis: ok
+                  kafka: ok
+                  version: 1.0.0
+        '503':
+          description: The database or Redis is unreachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/HealthResponse'
+              example:
+                data:
+                  database: 'error: connection refused'
+                  redis: ok
+                  kafka: disabled
+                  version: 1.0.0
+
+  # -------------------------------------------------------------------- auth
+  /api/users:
+    post:
+      tags: [Auth]
+      summary: Register a user
+      description: New users are created `active` with the `user` role.
+      operationId: registerUser
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterUserRequest'
+      responses:
+        '201':
+          description: The created user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/UserResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: That email is already registered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                errors: that email is already registered
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [Account]
+      summary: Log out
+      description: |
+        Revokes the session behind the presented token and evicts its cached
+        entry, so the token stops working immediately rather than at TTL.
+      operationId: logout
+      responses:
+        '200': { $ref: '#/components/responses/BooleanOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/users/_login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      description: |
+        Returns a session token to send as a bearer token on every other
+        endpoint. The `User-Agent` header and the caller's IP are recorded on
+        the session so the user can recognise it in `GET /api/users/_sessions`.
+
+        Rate limited per IP — 30 attempts per 5 minutes by default
+        (`SECURITY_RATELIMIT_LOGIN_ATTEMPTS` / `_WINDOW`). Exceeding it returns
+        `429` with a `Retry-After` header.
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginUserRequest'
+      responses:
+        '200':
+          description: The session token and its owner.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/LoginResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Unknown email or wrong password. Deliberately does not distinguish the two.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '403':
+          description: The account is suspended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                errors: this account is suspended
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/users/_forgot-password:
+    post:
+      tags: [Auth]
+      summary: Request a password reset
+      description: |
+        Always answers `true` whether or not the address is registered, so the
+        endpoint cannot be used to enumerate accounts. When the address does
+        exist, a reset token is stored in Redis (30 minute TTL by default) and
+        mailed to the user.
+
+        Rate limited per IP — 10 attempts per 15 minutes by default, tighter
+        than login because each attempt sends mail.
+      operationId: forgotPassword
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ForgotPasswordRequest'
+      responses:
+        '200': { $ref: '#/components/responses/BooleanOk' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/users/_reset-password:
+    post:
+      tags: [Auth]
+      summary: Complete a password reset
+      description: Consumes the token from the reset mail and sets a new password.
+      operationId: resetPassword
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetPasswordRequest'
+      responses:
+        '200': { $ref: '#/components/responses/BooleanOk' }
+        '400':
+          description: The token is invalid, already used, or expired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                errors: that reset link is invalid or has expired
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ----------------------------------------------------------------- account
+  /api/users/_current:
+    get:
+      tags: [Account]
+      summary: Get the signed-in user
+      operationId: currentUser
+      responses:
+        '200':
+          description: The signed-in user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/UserResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      tags: [Account]
+      summary: Update the signed-in user
+      description: |
+        Only the fields present in the body are changed. Sending `password`
+        re-hashes it; it does not revoke other sessions.
+      operationId: updateCurrentUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+      responses:
+        '200':
+          description: The updated user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/UserResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/users/_sessions:
+    get:
+      tags: [Account]
+      summary: List active sessions
+      description: |
+        Not paginated. The session the request was made with is flagged
+        `current: true` so a client can label it and avoid revoking it by
+        accident.
+      operationId: listSessions
+      responses:
+        '200':
+          description: Every unexpired session for the signed-in user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SessionResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/users/_sessions/{sessionId}:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    delete:
+      tags: [Account]
+      summary: Revoke a session
+      description: |
+        Revokes one of the caller's own sessions and evicts its cached entry.
+        Revoking the current session is equivalent to logging out.
+      operationId: revokeSession
+      responses:
+        '200': { $ref: '#/components/responses/BooleanOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ----------------------------------------------------------------- catalog
+  /api/mail-provider-types:
+    get:
+      tags: [Catalog]
+      summary: List connectable mail providers
+      description: |
+        Merges the `mail_providers` rows (which mailboxes a user may pick, and
+        the host/port preset for each) with the registry descriptor (what the
+        client for that kind can actually do). This is what drives the connect
+        form — adding a provider is a seed row, not a code change.
+
+        A provider with `available: false` is listed with an
+        `unavailable_reason` so the form can grey it out and say why.
+      operationId: listMailProviderTypes
+      responses:
+        '200':
+          description: The connectable providers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MailProviderResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/event-types:
+    get:
+      tags: [Catalog]
+      summary: List event handler types
+      description: |
+        Each entry describes one registered event handler and the fields its
+        `config` accepts. `uses_notifiers` tells the form whether to offer a
+        notifier picker alongside the config fields.
+      operationId: listEventTypes
+      responses:
+        '200':
+          description: The registered event handlers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EventTypeResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/notifier-types:
+    get:
+      tags: [Catalog]
+      summary: List notifier channel types
+      description: |
+        `requires_verification: true` means a notifier of this type must go
+        through `POST /api/notifiers/{notifierId}/_verify` before it will
+        deliver anything.
+      operationId: listNotifierTypes
+      responses:
+        '200':
+          description: The registered delivery channels.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/NotifierTypeResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/filter-fields:
+    get:
+      tags: [Catalog]
+      summary: List filterable message fields
+      description: |
+        The fields a watcher filter may target, and which operators each one
+        accepts — a `size` field takes `gt`/`lt`, a `subject` takes the string
+        operators. Use this to constrain the operator dropdown per field.
+      operationId: listFilterFields
+      responses:
+        '200':
+          description: The filterable fields and their operators.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FilterFieldResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------------------------------------------------- mail accounts
+  /api/mail-accounts:
+    get:
+      tags: [Mail Accounts]
+      summary: List connected mail accounts
+      operationId: listMailAccounts
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: status
+          in: query
+          description: Filter by connection status.
+          schema:
+            $ref: '#/components/schemas/MailAccountStatus'
+        - name: provider
+          in: query
+          description: Filter by provider slug, e.g. `gmail`.
+          schema: { type: string, maxLength: 40 }
+      responses:
+        '200':
+          description: A page of mail accounts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MailAccountResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Mail Accounts]
+      summary: Connect a mail account
+      description: |
+        Provider-agnostic: `settings` carries whatever the chosen provider's
+        `config_schema` asked for, which is why a client can render this form
+        from `GET /api/mail-provider-types` without knowing about IMAP.
+
+        Credentials are encrypted at rest and are never returned by any
+        endpoint. The account is created `pending`; call `_verify` to test the
+        credentials and move it to `verified`.
+      operationId: createMailAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMailAccountRequest'
+      responses:
+        '201':
+          description: The connected account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/MailAccountResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/mail-accounts/oauth/{provider}/_authorize:
+    parameters:
+      - $ref: '#/components/parameters/Provider'
+    get:
+      tags: [Mail Accounts]
+      summary: Begin an OAuth connect flow
+      description: |
+        Returns the provider's consent URL to redirect the browser to, plus the
+        opaque `state` that ties the callback back to this user. Send the user
+        to `redirect_url`; the provider then calls `_callback`.
+      operationId: oauthAuthorize
+      responses:
+        '200':
+          description: Where to send the user, and the state to expect back.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/OAuthAuthorizeResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/mail-accounts/oauth/{provider}/_callback:
+    parameters:
+      - $ref: '#/components/parameters/Provider'
+    get:
+      tags: [Mail Accounts]
+      summary: Complete an OAuth connect flow
+      description: |
+        Called by the provider, not by your client. Authenticated by the `state`
+        issued at `_authorize` rather than by a session, which is why this route
+        needs no bearer token. Exchanges `code` for tokens, encrypts them, and
+        creates or updates the mail account.
+      operationId: oauthCallback
+      security: []
+      parameters:
+        - name: code
+          in: query
+          required: true
+          description: The authorization code issued by the provider.
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          description: The value returned by `_authorize`.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The connected account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/MailAccountResponse'
+        '400':
+          description: Missing, unknown, or expired `state`, or the provider rejected the code.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501': { $ref: '#/components/responses/NotImplemented' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/mail-accounts/{accountId}:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    get:
+      tags: [Mail Accounts]
+      summary: Get a mail account
+      operationId: getMailAccount
+      responses:
+        '200':
+          description: The account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/MailAccountResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      tags: [Mail Accounts]
+      summary: Update a mail account
+      description: |
+        Only the fields present in the body are changed. Sending `password`
+        re-encrypts the stored credential and resets the account to `pending`,
+        so re-verify afterwards. `status` here accepts only `verified` or
+        `disabled` — `disabled` stops the worker from polling the mailbox.
+      operationId: updateMailAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMailAccountRequest'
+      responses:
+        '200':
+          description: The updated account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/MailAccountResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [Mail Accounts]
+      summary: Delete a mail account
+      description: Rejected while watchers still reference the account.
+      operationId: deleteMailAccount
+      responses:
+        '200': { $ref: '#/components/responses/BooleanOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/mail-accounts/{accountId}/_verify:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    post:
+      tags: [Mail Accounts]
+      summary: Verify credentials
+      description: |
+        Opens a live connection to the mailbox. On success the account moves to
+        `verified` and `folders_found` reports how many folders were listed; on
+        failure it moves to `error` and `last_error` carries the reason.
+      operationId: verifyMailAccount
+      responses:
+        '200':
+          description: The verification result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/VerifyMailAccountResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/mail-accounts/{accountId}/_sync:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    post:
+      tags: [Mail Accounts]
+      summary: Sync now
+      description: |
+        Runs the poll-and-match pipeline for this account immediately instead of
+        waiting for the worker's next pass, and records a sync run. Synchronous:
+        the response reports what the pass actually did.
+      operationId: syncMailAccount
+      responses:
+        '200':
+          description: What the sync pass fetched and matched.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SyncMailAccountResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/mail-accounts/{accountId}/folders:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    get:
+      tags: [Mail Accounts]
+      summary: List mailbox folders
+      description: |
+        Read live from the mail server, so this needs working credentials. Use
+        it to populate the folder picker when creating a watcher.
+      operationId: listMailAccountFolders
+      responses:
+        '200':
+          description: The folders on the server.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FolderResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/mail-accounts/{accountId}/sync-runs:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    get:
+      tags: [Mail Accounts]
+      summary: List sync history
+      description: One row per poll pass, newest first.
+      operationId: listMailAccountSyncRuns
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: A page of sync runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MailSyncRunResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # -------------------------------------------------------------- notifiers
+  /api/notifiers:
+    get:
+      tags: [Notifiers]
+      summary: List notifiers
+      operationId: listNotifiers
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: type
+          in: query
+          description: Filter by channel type, e.g. `telegram`.
+          schema: { type: string, maxLength: 30 }
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/NotifierStatus'
+      responses:
+        '200':
+          description: A page of notifiers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/NotifierResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Notifiers]
+      summary: Create a notifier
+      description: |
+        `config` holds the non-secret fields from the type's `config_schema`;
+        `secrets` holds the fields marked `secret`, which are encrypted at rest
+        and never returned. Created `pending` when the type requires
+        verification.
+      operationId: createNotifier
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateNotifierRequest'
+      responses:
+        '201':
+          description: The created notifier.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/NotifierResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/notifiers/{notifierId}:
+    parameters:
+      - $ref: '#/components/parameters/NotifierId'
+    get:
+      tags: [Notifiers]
+      summary: Get a notifier
+      operationId: getNotifier
+      responses:
+        '200':
+          description: The notifier.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/NotifierResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      tags: [Notifiers]
+      summary: Update a notifier
+      description: |
+        Only the fields present in the body are changed. Setting
+        `is_default: true` clears the flag on the user's other notifiers.
+      operationId: updateNotifier
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateNotifierRequest'
+      responses:
+        '200':
+          description: The updated notifier.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/NotifierResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [Notifiers]
+      summary: Delete a notifier
+      description: Rejected while watcher events still reference the notifier.
+      operationId: deleteNotifier
+      responses:
+        '200': { $ref: '#/components/responses/BooleanOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/notifiers/{notifierId}/_verify:
+    parameters:
+      - $ref: '#/components/parameters/NotifierId'
+    post:
+      tags: [Notifiers]
+      summary: Verify a notifier
+      description: |
+        Two-step, and the body decides which step you are on:
+
+        - **Empty body** — issues a `verification_code`. For Telegram, the user
+          sends that code to the bot, which binds their chat to this notifier
+          through the webhook below.
+        - **`{"code": "..."}`** — confirms a code the user was given out of
+          band, moving the notifier to `verified`.
+
+        An unparseable body is treated as an empty one rather than a `400`.
+      operationId: verifyNotifier
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyNotifierRequest'
+      responses:
+        '200':
+          description: The issued code, or the outcome of confirming one.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/VerifyNotifierResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/notifiers/{notifierId}/_test:
+    parameters:
+      - $ref: '#/components/parameters/NotifierId'
+    post:
+      tags: [Notifiers]
+      summary: Send a test notification
+      description: |
+        Delivers a sample message through the real channel. Answers `200` with
+        `delivered: false` and an `error` when the channel rejected it — a
+        failed delivery is a result, not an HTTP error.
+      operationId: testNotifier
+      responses:
+        '200':
+          description: The delivery result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/TestNotifierResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # --------------------------------------------------------------- watchers
+  /api/watchers:
+    get:
+      tags: [Watchers]
+      summary: List watchers
+      operationId: listWatchers
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: status
+          in: query
+          description: |
+            Filter by status. `all` includes archived watchers, which are
+            otherwise excluded.
+          schema:
+            type: string
+            enum: [active, paused, archived, all]
+        - name: mail_account_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: q
+          in: query
+          description: Free-text search over the watcher name.
+          schema: { type: string, maxLength: 150 }
+      responses:
+        '200':
+          description: A page of watchers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WatcherResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Watchers]
+      summary: Create a watcher
+      description: |
+        Filters and events can be created inline in one call, which is how the
+        SPA's single-page watcher form submits. `match_mode` decides whether a
+        message must satisfy every filter (`all`) or any one of them (`any`).
+
+        `watch_from` bounds how far back the first sync looks; omit it to start
+        from now. `cooldown_seconds` suppresses repeat matches for the same
+        watcher within that window.
+      operationId: createWatcher
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWatcherRequest'
+      responses:
+        '201':
+          description: The created watcher, with its filters and events.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/WatcherResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: The referenced mail account does not exist or is not yours.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/watchers/{watcherId}:
+    parameters:
+      - $ref: '#/components/parameters/WatcherId'
+    get:
+      tags: [Watchers]
+      summary: Get a watcher
+      description: Includes the watcher's mail account, filters and events.
+      operationId: getWatcher
+      responses:
+        '200':
+          description: The watcher.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/WatcherResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      tags: [Watchers]
+      summary: Update a watcher
+      description: |
+        Metadata only. Filters go through `PUT .../filters` and events through
+        the events endpoints; the mail account cannot be changed after creation.
+      operationId: updateWatcher
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWatcherRequest'
+      responses:
+        '200':
+          description: The updated watcher.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/WatcherResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [Watchers]
+      summary: Delete a watcher
+      description: |
+        Permanent, and takes the watcher's filters, events and match history
+        with it. Prefer `_archive` to keep the history.
+      operationId: deleteWatcher
+      responses:
+        '200': { $ref: '#/components/responses/BooleanOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/watchers/{watcherId}/_archive:
+    parameters:
+      - $ref: '#/components/parameters/WatcherId'
+    post:
+      tags: [Watchers]
+      summary: Archive a watcher
+      description: |
+        Stops the watcher and hides it from the default list, keeping its match
+        history. Reversible with `_restore`.
+      operationId: archiveWatcher
+      responses:
+        '200': { $ref: '#/components/responses/WatcherOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/watchers/{watcherId}/_restore:
+    parameters:
+      - $ref: '#/components/parameters/WatcherId'
+    post:
+      tags: [Watchers]
+      summary: Restore an archived watcher
+      description: |
+        Brings the watcher back **paused**, not active, so it cannot start
+        firing before its owner has looked at it. Call `_resume` to start it.
+      operationId: restoreWatcher
+      responses:
+        '200': { $ref: '#/components/responses/WatcherOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/watchers/{watcherId}/_pause:
+    parameters:
+      - $ref: '#/components/parameters/WatcherId'
+    post:
+      tags: [Watchers]
+      summary: Pause a watcher
+      description: The watcher stops matching new mail but keeps its configuration and history.
+      operationId: pauseWatcher
+      responses:
+        '200': { $ref: '#/components/responses/WatcherOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/watchers/{watcherId}/_resume:
+    parameters:
+      - $ref: '#/components/parameters/WatcherId'
+    post:
+      tags: [Watchers]
+      summary: Resume a watcher
+      operationId: resumeWatcher
+      responses:
+        '200': { $ref: '#/components/responses/WatcherOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/watchers/{watcherId}/_test:
+    parameters:
+      - $ref: '#/components/parameters/WatcherId'
+    post:
+      tags: [Watchers]
+      summary: Dry-run the filters
+      description: |
+        Reads a sample of recent messages from the mailbox and reports which
+        would match, **without** creating matches or firing events. Use it to
+        check a filter set before resuming the watcher.
+
+        The body is optional; an unparseable one is treated as empty.
+      operationId: testWatcher
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TestWatcherRequest'
+      responses:
+        '200':
+          description: How many messages were scanned and which matched.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/TestWatcherResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/watchers/{watcherId}/stats:
+    parameters:
+      - $ref: '#/components/parameters/WatcherId'
+    get:
+      tags: [Watchers]
+      summary: Watcher statistics
+      description: Run outcome totals plus a daily match count for the charted window.
+      operationId: watcherStats
+      parameters:
+        - name: days
+          in: query
+          description: Size of the window in days.
+          schema: { type: integer, minimum: 1, maximum: 365, default: 30 }
+      responses:
+        '200':
+          description: The statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/WatcherStatsResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # -------------------------------------------------------- watcher filters
+  /api/watchers/{watcherId}/filters:
+    parameters:
+      - $ref: '#/components/parameters/WatcherId'
+    get:
+      tags: [Watcher Filters]
+      summary: List a watcher's filters
+      operationId: getWatcherFilters
+      responses:
+        '200':
+          description: The filters, in position order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WatcherFilterResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    put:
+      tags: [Watcher Filters]
+      summary: Replace a watcher's filters
+      description: |
+        Replaces the whole set rather than patching individual rows, because the
+        UI edits filters as one form. Filters absent from the body are deleted;
+        omitting `filters` entirely clears them.
+
+        `match_mode` can be changed in the same call.
+      operationId: replaceWatcherFilters
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplaceFiltersRequest'
+      responses:
+        '200':
+          description: The stored filters.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WatcherFilterResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # --------------------------------------------------------- watcher events
+  /api/watchers/{watcherId}/events:
+    parameters:
+      - $ref: '#/components/parameters/WatcherId'
+    get:
+      tags: [Watcher Events]
+      summary: List a watcher's events
+      description: Not paginated. Returned in `position` order.
+      operationId: listWatcherEvents
+      responses:
+        '200':
+          description: The events, in position order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WatcherEventResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    post:
+      tags: [Watcher Events]
+      summary: Add an event to a watcher
+      description: |
+        `type` must be one of the handlers from `GET /api/event-types`, and
+        `config` must satisfy that type's `config_schema`.
+
+        `run_mode` decides the schedule: `immediate` fires on match, `delayed`
+        waits `delay_seconds`, `recurring` repeats on
+        `repeat_interval_seconds` until `repeat_max`, `repeat_until`, or — when
+        `stop_on_ack` is set — until someone acknowledges a run.
+      operationId: createWatcherEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWatcherEventRequest'
+      responses:
+        '201':
+          description: The created event.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/WatcherEventResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/watchers/{watcherId}/events/_reorder:
+    parameters:
+      - $ref: '#/components/parameters/WatcherId'
+    post:
+      tags: [Watcher Events]
+      summary: Reorder a watcher's events
+      description: |
+        Send every event id in the order you want. Positions are rewritten to
+        match the array, so a partial list is rejected rather than silently
+        reordering a subset.
+      operationId: reorderWatcherEvents
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReorderWatcherEventRequest'
+      responses:
+        '200':
+          description: The events in their new order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WatcherEventResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/watchers/{watcherId}/events/{eventId}:
+    parameters:
+      - $ref: '#/components/parameters/WatcherId'
+      - $ref: '#/components/parameters/EventId'
+    get:
+      tags: [Watcher Events]
+      summary: Get a watcher event
+      operationId: getWatcherEvent
+      responses:
+        '200':
+          description: The event.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/WatcherEventResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      tags: [Watcher Events]
+      summary: Update a watcher event
+      description: |
+        Only the fields present in the body are changed. `type` is immutable —
+        delete the event and add a new one to change the handler. Sending
+        `notifier_ids` replaces the event's notifier set.
+      operationId: updateWatcherEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWatcherEventRequest'
+      responses:
+        '200':
+          description: The updated event.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/WatcherEventResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [Watcher Events]
+      summary: Delete a watcher event
+      operationId: deleteWatcherEvent
+      responses:
+        '200': { $ref: '#/components/responses/BooleanOk' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/watchers/{watcherId}/events/{eventId}/_test:
+    parameters:
+      - $ref: '#/components/parameters/WatcherId'
+      - $ref: '#/components/parameters/EventId'
+    post:
+      tags: [Watcher Events]
+      summary: Fire an event once, for real
+      description: |
+        Runs the event against a matched email — `matched_email_id` if given,
+        otherwise the watcher's most recent match — and returns the resulting
+        run. This performs **real** deliveries; it is a live test, not a
+        simulation. The body is optional.
+      operationId: testWatcherEvent
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TestWatcherEventRequest'
+      responses:
+        '200':
+          description: The event run that was executed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/EventRunResponse'
+        '400':
+          description: The watcher has no matched email to test against.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # --------------------------------------------------------------- activity
+  /api/matches:
+    get:
+      tags: [Activity]
+      summary: List matched emails
+      operationId: listMatches
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: watcher_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: mail_account_id
+          in: query
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - name: q
+          in: query
+          description: Free-text search over subject and sender.
+          schema: { type: string, maxLength: 200 }
+      responses:
+        '200':
+          description: A page of matched emails.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MatchedEmailResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/matches/{matchId}:
+    parameters:
+      - $ref: '#/components/parameters/MatchId'
+    get:
+      tags: [Activity]
+      summary: Get a matched email
+      description: Includes the event runs the match triggered.
+      operationId: getMatch
+      responses:
+        '200':
+          description: The matched email.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/MatchedEmailResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/event-runs:
+    get:
+      tags: [Activity]
+      summary: List event runs
+      operationId: listRuns
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: watcher_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/RunStatus'
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: A page of event runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EventRunResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/event-runs/{runId}:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [Activity]
+      summary: Get an event run
+      description: Includes the deliveries the run produced.
+      operationId: getRun
+      responses:
+        '200':
+          description: The event run.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/EventRunResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/event-runs/{runId}/_retry:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      tags: [Activity]
+      summary: Retry a failed run
+      description: |
+        Re-queues the run and executes it immediately, returning the run in its
+        new state. Only a run that has finished can be retried.
+      operationId: retryRun
+      responses:
+        '200':
+          description: The re-executed run.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/EventRunResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/event-runs/{runId}/_cancel:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      tags: [Activity]
+      summary: Cancel pending runs
+      description: |
+        Cancels this run and any later pending occurrences of the same recurring
+        event. `cancelled` reports how many rows were affected.
+      operationId: cancelRun
+      responses:
+        '200':
+          description: How many pending runs were cancelled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CancelRunResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/event-runs/{runId}/_ack:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      tags: [Activity]
+      summary: Acknowledge a run
+      description: |
+        Marks the run acknowledged. For a recurring event configured with
+        `stop_on_ack`, this also cancels its remaining occurrences —
+        `cancelled_occurrences` reports how many. This is what the Telegram
+        acknowledge button calls through the webhook below.
+      operationId: ackRun
+      responses:
+        '200':
+          description: When it was acknowledged, and what that stopped.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/AckRunResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/deliveries:
+    get:
+      tags: [Activity]
+      summary: List notification deliveries
+      description: One row per attempt to push a message through a channel.
+      operationId: listDeliveries
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: event_run_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: notifier_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/DeliveryStatus'
+      responses:
+        '200':
+          description: A page of deliveries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DeliveryResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/dashboard/summary:
+    get:
+      tags: [Activity]
+      summary: Dashboard rollup
+      description: |
+        Counts by status for the caller's watchers, mail accounts and notifiers,
+        24-hour match and failure totals, and a recent-activity feed. One call
+        backs the whole dashboard.
+      operationId: dashboardSummary
+      responses:
+        '200':
+          description: The rollup.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/DashboardSummaryResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ------------------------------------------------------------------ admin
+  /api/admin/stats:
+    get:
+      tags: [Admin]
+      summary: Instance statistics
+      description: User counts, active watchers, accounts in error, and queue depth.
+      operationId: adminStats
+      responses:
+        '200':
+          description: The statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/AdminStatsResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/admin/users:
+    get:
+      tags: [Admin]
+      summary: List all users
+      operationId: adminListUsers
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: q
+          in: query
+          description: Free-text search over email and name.
+          schema: { type: string, maxLength: 320 }
+        - name: role
+          in: query
+          description: Filter by role slug.
+          schema: { type: string, maxLength: 50 }
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/UserStatus'
+      responses:
+        '200':
+          description: A page of users with their resource counts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AdminUserResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/admin/users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Admin]
+      summary: Get any user
+      operationId: adminGetUser
+      responses:
+        '200':
+          description: The user with their resource counts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/AdminUserResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    patch:
+      tags: [Admin]
+      summary: Update any user
+      description: |
+        Changes a user's name or role set. Sending `roles` replaces the set
+        outright, and evicts that user's cached sessions so the new roles take
+        effect on their next request rather than at cache TTL.
+      operationId: adminUpdateUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAdminUserRequest'
+      responses:
+        '200':
+          description: The updated user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/AdminUserResponse'
+        '400':
+          description: The body is malformed, or one or more roles do not exist.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                errors: one or more roles do not exist
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/admin/users/{userId}/_suspend:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags: [Admin]
+      summary: Suspend a user
+      description: |
+        Blocks the user from signing in, revokes their sessions, and pauses
+        their watchers so a suspended account stops generating traffic.
+        `watchers_paused` reports how many were paused.
+      operationId: adminSuspendUser
+      responses:
+        '200':
+          description: The new status and how many watchers were paused.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SuspendUserResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/admin/users/{userId}/_restore:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags: [Admin]
+      summary: Restore a suspended user
+      description: |
+        Returns the account to `active`. Watchers paused by the suspension are
+        **not** resumed automatically — the user resumes the ones they still
+        want.
+      operationId: adminRestoreUser
+      responses:
+        '200':
+          description: The new status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SuspendUserResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/admin/users/{userId}/_impersonate:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags: [Admin]
+      summary: Impersonate a user
+      description: |
+        Issues a session token that acts as the target user. The session is
+        flagged `impersonated` and carries the real actor, so audit rows written
+        during it attribute the action to the admin, not the user being
+        impersonated.
+
+        Impersonating another superadmin is refused, as is impersonating
+        yourself.
+      operationId: adminImpersonateUser
+      responses:
+        '200':
+          description: A token acting as the target user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ImpersonateResponse'
+        '400':
+          description: You are already signed in as that user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Not a superadmin, or the target is another superadmin.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/admin/watchers:
+    get:
+      tags: [Admin]
+      summary: List watchers across all users
+      description: Same shape as `GET /api/watchers`, with the owner filter open and settable via `user_id`.
+      operationId: adminListWatchers
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/OwnerUserId'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [active, paused, archived, all]
+        - name: mail_account_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: q
+          in: query
+          schema: { type: string, maxLength: 150 }
+      responses:
+        '200':
+          description: A page of watchers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WatcherResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/admin/mail-accounts:
+    get:
+      tags: [Admin]
+      summary: List mail accounts across all users
+      operationId: adminListMailAccounts
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/OwnerUserId'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/MailAccountStatus'
+        - name: provider
+          in: query
+          schema: { type: string, maxLength: 40 }
+      responses:
+        '200':
+          description: A page of mail accounts.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MailAccountResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/admin/notifiers:
+    get:
+      tags: [Admin]
+      summary: List notifiers across all users
+      operationId: adminListNotifiers
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/OwnerUserId'
+        - name: type
+          in: query
+          schema: { type: string, maxLength: 30 }
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/NotifierStatus'
+      responses:
+        '200':
+          description: A page of notifiers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/NotifierResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/admin/event-runs:
+    get:
+      tags: [Admin]
+      summary: List event runs across all users
+      operationId: adminListRuns
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - $ref: '#/components/parameters/OwnerUserId'
+        - name: watcher_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/RunStatus'
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: A page of event runs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EventRunResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/admin/audit-logs:
+    get:
+      tags: [Admin]
+      summary: List audit log entries
+      description: |
+        The trail of privileged and state-changing actions. An entry written
+        during an impersonated session records both the real actor
+        (`actor_user_id`) and who they were acting as
+        (`impersonated_user_id`).
+      operationId: adminListAuditLogs
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+        - name: actor_user_id
+          in: query
+          description: Only entries written by this actor.
+          schema: { type: string, format: uuid }
+        - name: action
+          in: query
+          description: Exact action slug, e.g. `user.suspend`.
+          schema: { type: string, maxLength: 80 }
+        - name: entity_type
+          in: query
+          description: Exact entity type, e.g. `watcher`.
+          schema: { type: string, maxLength: 50 }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: A page of audit entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, paging]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AuditLogResponse'
+                  paging:
+                    $ref: '#/components/schemas/PageMetadata'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # --------------------------------------------------------------- webhooks
+  /api/webhooks/telegram:
+    post:
+      tags: [Webhooks]
+      summary: Telegram Bot API webhook
+      description: |
+        Called by Telegram, not by your client. Handles two things: a message
+        carrying a verification code, which binds the sender's chat to a pending
+        notifier, and an acknowledge button press, which acknowledges an event
+        run.
+
+        **Always answers `200` with `data: true`**, whatever it made of the
+        payload, so Telegram does not retry. Failures are logged, not returned.
+      operationId: telegramWebhook
+      security: []
+      requestBody:
+        required: true
+        description: The slice of the Bot API update payload this endpoint acts on.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TelegramWebhookRequest'
+      responses:
+        '200': { $ref: '#/components/responses/BooleanOk' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        The `token` from `POST /api/users/_login`. The middleware accepts both
+        `Authorization: Bearer <token>` and the bare token.
+
+  # ------------------------------------------------------------- parameters
+  parameters:
+    Page:
+      name: page
+      in: query
+      description: 1-based page number. Values below 1 are clamped to 1.
+      schema: { type: integer, minimum: 1, default: 1 }
+    Size:
+      name: size
+      in: query
+      description: Items per page. Values above 100 are clamped to 100.
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    From:
+      name: from
+      in: query
+      description: Lower bound, Unix milliseconds. An unparseable value is ignored rather than rejected.
+      schema: { type: integer, format: int64 }
+    To:
+      name: to
+      in: query
+      description: Upper bound, Unix milliseconds. An unparseable value is ignored rather than rejected.
+      schema: { type: integer, format: int64 }
+    OwnerUserId:
+      name: user_id
+      in: query
+      description: Restrict to one owner. Omit to span every user.
+      schema: { type: string, format: uuid }
+    AccountId:
+      name: accountId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    NotifierId:
+      name: notifierId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    WatcherId:
+      name: watcherId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    MatchId:
+      name: matchId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Provider:
+      name: provider
+      in: path
+      required: true
+      description: Provider slug, e.g. `gmail`.
+      schema: { type: string, maxLength: 40 }
+
+  # -------------------------------------------------------- shared responses
+  responses:
+    BooleanOk:
+      description: Succeeded.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data]
+            properties:
+              data: { type: boolean, const: true }
+          example:
+            data: true
+    WatcherOk:
+      description: The watcher in its new state.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data]
+            properties:
+              data:
+                $ref: '#/components/schemas/WatcherResponse'
+    BadRequest:
+      description: The body could not be parsed, or a field failed validation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            errors: Bad Request
+    Unauthorized:
+      description: The token is missing, malformed, expired, or revoked.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            errors: Unauthorized
+    Forbidden:
+      description: Authenticated, but not allowed to do this.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            errors: this area needs additional permissions
+    NotFound:
+      description: |
+        No such resource, or it belongs to another user. Ownership failures
+        answer `404` rather than `403` so the API does not confirm that an id
+        exists to someone who cannot see it.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            errors: Not Found
+    Conflict:
+      description: The request conflicts with the current state of the resource.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Unprocessable:
+      description: |
+        Well-formed, but rejected on a domain rule — an unknown provider or
+        handler type, a config that does not satisfy its schema, or a remote
+        system that refused the operation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    TooManyRequests:
+      description: Rate limit exceeded for this IP.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            errors: too many attempts, please wait before trying again
+    NotImplemented:
+      description: The provider does not support this operation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    InternalError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            errors: Internal Server Error
+
+  # ----------------------------------------------------------------- schemas
+  schemas:
+    # ---- envelope and primitives
+    ErrorResponse:
+      type: object
+      description: |
+        The only body shape on a failure. `data` is absent; `errors` carries the
+        message and the HTTP status carries the kind.
+      properties:
+        errors:
+          type: string
+          description: Human-readable message. Not a stable machine-readable code.
+      required: [errors]
+
+    PageMetadata:
+      type: object
+      description: Present on paginated list endpoints only.
+      properties:
+        page: { type: integer, description: The 1-based page returned. }
+        size: { type: integer, description: Items per page. }
+        total_item: { type: integer, format: int64, description: Matching rows across every page. }
+        total_page: { type: integer, format: int64, description: Total pages at this size. }
+      required: [page, size, total_item, total_page]
+
+    Timestamp:
+      type: integer
+      format: int64
+      description: Unix milliseconds.
+
+    JSONObject:
+      type: object
+      description: Free-form JSON whose shape is defined by the relevant `config_schema`.
+      additionalProperties: true
+
+    StatusCounts:
+      type: object
+      description: Row counts keyed by status value.
+      additionalProperties:
+        type: integer
+        format: int64
+      examples:
+        - { active: 12, paused: 3, archived: 1 }
+
+    # ---- enums
+    UserStatus:
+      type: string
+      enum: [active, suspended]
+    MailAccountStatus:
+      type: string
+      description: |
+        `pending` until verified, `error` once a credential check fails,
+        `disabled` when the owner has stopped it being polled.
+      enum: [pending, verified, error, disabled]
+    NotifierStatus:
+      type: string
+      enum: [pending, verified, error, disabled]
+    WatcherStatus:
+      type: string
+      enum: [active, paused, archived]
+    RunStatus:
+      type: string
+      enum: [pending, running, succeeded, failed, cancelled, skipped]
+    DeliveryStatus:
+      type: string
+      enum: [pending, sent, failed]
+    SyncStatus:
+      type: string
+      enum: [running, ok, error]
+    MatchMode:
+      type: string
+      description: Whether a message must satisfy every filter or any one of them.
+      enum: [all, any]
+    RunMode:
+      type: string
+      description: |
+        `immediate` fires on match; `delayed` waits `delay_seconds`;
+        `recurring` repeats on `repeat_interval_seconds`.
+      enum: [immediate, delayed, recurring]
+    FilterField:
+      type: string
+      description: The part of the message a filter tests. `header` also needs `header_name`.
+      enum: [subject, from, to, cc, body, header, attachment_name, has_attachment, size]
+    FilterOperator:
+      type: string
+      description: |
+        String operators apply to text fields; `gt`/`lt` apply to `size`;
+        `exists` applies to `header` and `has_attachment`.
+      enum: [contains, not_contains, equals, starts_with, ends_with, regex, gt, lt, exists]
+    RoleSlug:
+      type: string
+      enum: [user, superadmin]
+    AuthMode:
+      type: string
+      description: How credentials are presented to the mail server.
+      enum: [password, app_password, oauth2, xoauth2]
+
+    # ---- catalog
+    Schema:
+      type: object
+      description: |
+        Describes a plug-in's configuration so a client can render its form from
+        the registry rather than hard-coding it.
+      properties:
+        fields:
+          type: array
+          items: { $ref: '#/components/schemas/SchemaField' }
+      required: [fields]
+
+    SchemaField:
+      type: object
+      properties:
+        name: { type: string, description: The key to send in `config` or `settings`. }
+        label: { type: string, description: Display label for the form control. }
+        type:
+          type: string
+          description: Which control to render.
+          enum: [string, text, int, bool, enum, secret]
+        required: { type: boolean }
+        options:
+          type: array
+          description: Allowed values. Present when `type` is `enum`.
+          items: { type: string }
+        placeholder: { type: string }
+        help: { type: string }
+        secret:
+          type: boolean
+          description: |
+            Send this field under `secrets` rather than `config`. Encrypted at
+            rest and never returned.
+      required: [name, label, type, required]
+
+    HealthResponse:
+      type: object
+      description: '`ok` when reachable, otherwise the failure reason (or `disabled`).'
+      properties:
+        database: { type: string }
+        redis: { type: string }
+        kafka: { type: string }
+        version: { type: string, description: 'From `APP_VERSION`.' }
+      required: [database, redis, kafka, version]
+
+    MailProviderResponse:
+      type: object
+      properties:
+        slug: { type: string, description: 'Identifier to send as `provider`, e.g. `gmail`.' }
+        label: { type: string }
+        kind: { type: string, description: 'Which client drives it, e.g. `imap`.' }
+        auth_modes:
+          type: array
+          description: The `auth_mode` values this provider accepts.
+          items: { $ref: '#/components/schemas/AuthMode' }
+        capabilities:
+          type: object
+          description: What the client for this kind supports, keyed by capability name.
+          additionalProperties: { type: boolean }
+        config_schema: { $ref: '#/components/schemas/Schema' }
+        defaults:
+          type: object
+          description: Host/port preset to prefill the connect form with.
+          additionalProperties: true
+        help_url: { type: string, description: Provider setup instructions. }
+        available:
+          type: boolean
+          description: 'False when no client is registered for this kind; see `unavailable_reason`.'
+        unavailable_reason: { type: string }
+      required: [slug, label, kind, auth_modes, capabilities, config_schema, available]
+
+    EventTypeResponse:
+      type: object
+      properties:
+        type: { type: string, description: 'The value to send as a watcher event''s `type`.' }
+        label: { type: string }
+        description: { type: string }
+        uses_notifiers:
+          type: boolean
+          description: Whether the form should offer a notifier picker for this handler.
+        config_schema: { $ref: '#/components/schemas/Schema' }
+      required: [type, label, description, uses_notifiers, config_schema]
+
+    NotifierTypeResponse:
+      type: object
+      properties:
+        type: { type: string, description: 'The value to send as a notifier''s `type`.' }
+        label: { type: string }
+        description: { type: string }
+        requires_verification:
+          type: boolean
+          description: Whether `_verify` must succeed before this channel will deliver.
+        config_schema: { $ref: '#/components/schemas/Schema' }
+      required: [type, label, description, requires_verification, config_schema]
+
+    FilterFieldResponse:
+      type: object
+      properties:
+        field: { $ref: '#/components/schemas/FilterField' }
+        label: { type: string }
+        value_type: { type: string, description: 'What `value` should hold, e.g. `string`, `int`, `bool`.' }
+        operators:
+          type: array
+          description: The operators valid for this field.
+          items: { $ref: '#/components/schemas/FilterOperator' }
+        help: { type: string }
+      required: [field, label, value_type, operators]
+
+    # ---- users, sessions
+    UserResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: string }
+        status: { $ref: '#/components/schemas/UserStatus' }
+        timezone: { type: string, description: 'IANA name, e.g. `Europe/Berlin`.' }
+        roles:
+          type: array
+          items: { $ref: '#/components/schemas/RoleSlug' }
+        email_verified_at: { $ref: '#/components/schemas/Timestamp' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+      required: [roles]
+
+    LoginResponse:
+      type: object
+      properties:
+        token:
+          type: string
+          description: Send as a bearer token. Not retrievable again — store it on receipt.
+        expires_at: { $ref: '#/components/schemas/Timestamp' }
+        user: { $ref: '#/components/schemas/UserResponse' }
+      required: [token, expires_at, user]
+
+    SessionResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        user_agent: { type: string, description: As sent when the session was created. }
+        ip: { type: string, description: 'Peer address, or the forwarded one when behind a trusted proxy.' }
+        current:
+          type: boolean
+          description: True for the session this request was made with.
+        expires_at: { $ref: '#/components/schemas/Timestamp' }
+        last_used_at: { $ref: '#/components/schemas/Timestamp' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+      required: [id, current, expires_at, last_used_at, created_at]
+
+    RegisterUserRequest:
+      type: object
+      properties:
+        email: { type: string, format: email, maxLength: 320 }
+        name: { type: string, maxLength: 100 }
+        password: { type: string, format: password, minLength: 6, maxLength: 100 }
+        timezone: { type: string, maxLength: 64, description: 'IANA name, e.g. `Europe/Berlin`.' }
+      required: [email, name, password]
+
+    LoginUserRequest:
+      type: object
+      properties:
+        email: { type: string, format: email, maxLength: 320 }
+        password: { type: string, format: password, maxLength: 100 }
+      required: [email, password]
+
+    UpdateUserRequest:
+      type: object
+      description: Only the fields present are changed.
+      properties:
+        name: { type: string, maxLength: 100 }
+        password: { type: string, format: password, minLength: 6, maxLength: 100 }
+        timezone: { type: string, maxLength: 64 }
+
+    ForgotPasswordRequest:
+      type: object
+      properties:
+        email: { type: string, format: email, maxLength: 320 }
+      required: [email]
+
+    ResetPasswordRequest:
+      type: object
+      properties:
+        token: { type: string, maxLength: 200, description: From the reset mail. }
+        password: { type: string, format: password, minLength: 6, maxLength: 100 }
+      required: [token, password]
+
+    # ---- mail accounts
+    MailAccountResponse:
+      type: object
+      description: Credentials are encrypted at rest and never appear here.
+      properties:
+        id: { type: string, format: uuid }
+        provider: { type: string, description: Provider slug. }
+        provider_label: { type: string }
+        kind: { type: string, description: 'Which client drives it, e.g. `imap`.' }
+        email_address: { type: string, format: email }
+        display_name: { type: string }
+        auth_mode: { $ref: '#/components/schemas/AuthMode' }
+        settings:
+          $ref: '#/components/schemas/JSONObject'
+          description: 'Non-secret connection settings, per the provider''s `config_schema`.'
+        token_expires_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: OAuth access token expiry, for OAuth accounts.
+        status: { $ref: '#/components/schemas/MailAccountStatus' }
+        last_verified_at: { $ref: '#/components/schemas/Timestamp' }
+        last_error: { type: string, description: Why the last verify or sync failed. }
+        last_synced_at: { $ref: '#/components/schemas/Timestamp' }
+        poll_interval_seconds: { type: integer, description: How often the worker polls this mailbox. }
+        next_poll_at: { $ref: '#/components/schemas/Timestamp' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+      required:
+        [id, provider, email_address, auth_mode, settings, status,
+         poll_interval_seconds, next_poll_at, created_at, updated_at]
+
+    CreateMailAccountRequest:
+      type: object
+      properties:
+        provider:
+          type: string
+          maxLength: 40
+          description: A `slug` from `GET /api/mail-provider-types`.
+        email_address: { type: string, format: email, maxLength: 320 }
+        display_name: { type: string, maxLength: 150 }
+        auth_mode:
+          $ref: '#/components/schemas/AuthMode'
+          description: Must be one of the provider's `auth_modes`.
+        settings:
+          $ref: '#/components/schemas/JSONObject'
+          description: The non-secret fields from the provider's `config_schema`.
+        username:
+          type: string
+          maxLength: 320
+          description: Only needed when the server's login name differs from the email address.
+        password:
+          type: string
+          format: password
+          maxLength: 255
+          description: Encrypted at rest. Never returned by any endpoint.
+        poll_interval_seconds:
+          type: integer
+          minimum: 30
+          maximum: 86400
+          description: Defaults to the provider's preset when omitted.
+      required: [provider, email_address]
+
+    UpdateMailAccountRequest:
+      type: object
+      description: Only the fields present are changed.
+      properties:
+        display_name: { type: string, maxLength: 150 }
+        settings: { $ref: '#/components/schemas/JSONObject' }
+        username: { type: string, maxLength: 320 }
+        password:
+          type: string
+          format: password
+          maxLength: 255
+          description: Re-encrypts the stored credential and resets the account to `pending`.
+        poll_interval_seconds: { type: integer, minimum: 30, maximum: 86400 }
+        status:
+          type: string
+          description: '`disabled` stops the worker polling this mailbox.'
+          enum: [verified, disabled]
+
+    FolderResponse:
+      type: object
+      properties:
+        name: { type: string, description: 'Server folder path, e.g. `INBOX`.' }
+        message_count: { type: integer }
+      required: [name, message_count]
+
+    VerifyMailAccountResponse:
+      type: object
+      properties:
+        status: { $ref: '#/components/schemas/MailAccountStatus' }
+        folders_found: { type: integer, description: Folders listed during the check. }
+        last_verified_at: { $ref: '#/components/schemas/Timestamp' }
+      required: [status, folders_found, last_verified_at]
+
+    SyncMailAccountResponse:
+      type: object
+      properties:
+        sync_run_id: { type: string, format: uuid }
+        messages_fetched: { type: integer }
+        matches_created: { type: integer }
+        status: { $ref: '#/components/schemas/SyncStatus' }
+      required: [sync_run_id, messages_fetched, matches_created, status]
+
+    MailSyncRunResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/SyncStatus' }
+        started_at: { $ref: '#/components/schemas/Timestamp' }
+        finished_at: { $ref: '#/components/schemas/Timestamp' }
+        messages_fetched: { type: integer }
+        matches_created: { type: integer }
+        error: { type: string }
+      required: [id, status, started_at, messages_fetched, matches_created]
+
+    OAuthAuthorizeResponse:
+      type: object
+      properties:
+        redirect_url: { type: string, format: uri, description: Send the user's browser here. }
+        state: { type: string, description: Opaque value the provider will return to `_callback`. }
+      required: [redirect_url, state]
+
+    # ---- notifiers
+    NotifierResponse:
+      type: object
+      description: Secrets are encrypted at rest and never appear here.
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, description: 'Channel type, e.g. `telegram`.' }
+        name: { type: string }
+        config:
+          $ref: '#/components/schemas/JSONObject'
+          description: The non-secret fields, per the type's `config_schema`.
+        status: { $ref: '#/components/schemas/NotifierStatus' }
+        verified_at: { $ref: '#/components/schemas/Timestamp' }
+        last_error: { type: string }
+        is_default:
+          type: boolean
+          description: Used by events that name no notifier. At most one per user.
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+      required: [id, type, name, config, status, is_default, created_at, updated_at]
+
+    CreateNotifierRequest:
+      type: object
+      properties:
+        type:
+          type: string
+          maxLength: 30
+          description: A `type` from `GET /api/notifier-types`.
+        name: { type: string, maxLength: 100 }
+        config:
+          $ref: '#/components/schemas/JSONObject'
+          description: The fields from the type's `config_schema` not marked `secret`.
+        secrets:
+          $ref: '#/components/schemas/JSONObject'
+          description: The fields marked `secret`. Encrypted at rest, never returned.
+        is_default:
+          type: boolean
+          description: Setting this clears the flag on your other notifiers.
+      required: [type, name]
+
+    UpdateNotifierRequest:
+      type: object
+      description: Only the fields present are changed.
+      properties:
+        name: { type: string, maxLength: 100 }
+        config: { $ref: '#/components/schemas/JSONObject' }
+        secrets: { $ref: '#/components/schemas/JSONObject' }
+        is_default:
+          type: [boolean, 'null']
+          description: Setting this clears the flag on your other notifiers.
+        status:
+          type: string
+          enum: [verified, disabled]
+
+    VerifyNotifierRequest:
+      type: object
+      description: Omit the body entirely to be issued a code instead of confirming one.
+      properties:
+        code:
+          type: string
+          maxLength: 20
+          description: The code the user was given out of band.
+
+    VerifyNotifierResponse:
+      type: object
+      properties:
+        status: { $ref: '#/components/schemas/NotifierStatus' }
+        verification_code:
+          type: string
+          description: Present when a code was just issued. Show it to the user to send to the channel.
+        verified_at: { $ref: '#/components/schemas/Timestamp' }
+        message: { type: string, description: What the user should do next. }
+      required: [status, message]
+
+    TestNotifierResponse:
+      type: object
+      properties:
+        delivered: { type: boolean }
+        provider_message_id: { type: string, description: The channel's own id for the message. }
+        error: { type: string, description: Present when `delivered` is false. }
+      required: [delivered]
+
+    TelegramWebhookRequest:
+      type: object
+      description: |
+        Only the fields this endpoint reads are described; Telegram sends a
+        larger payload and the rest is ignored.
+      properties:
+        message:
+          type: object
+          description: A message sent to the bot. Its text may be a verification code.
+          properties:
+            text: { type: string }
+            chat:
+              type: object
+              properties:
+                id: { type: integer, format: int64 }
+        callback_query:
+          type: object
+          description: An inline button press, such as the acknowledge button.
+          properties:
+            data: { type: string, description: The button's payload. }
+            from:
+              type: object
+              properties:
+                id: { type: integer, format: int64 }
+
+    # ---- watchers
+    WatcherResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+        status: { $ref: '#/components/schemas/WatcherStatus' }
+        match_mode: { $ref: '#/components/schemas/MatchMode' }
+        folder: { type: string, description: Mailbox folder watched. }
+        watch_from:
+          $ref: '#/components/schemas/Timestamp'
+          description: Messages older than this are ignored.
+        cooldown_seconds:
+          type: integer
+          description: Suppresses further matches on this watcher for this long after one fires.
+        last_matched_at: { $ref: '#/components/schemas/Timestamp' }
+        match_count: { type: integer, format: int64, description: Lifetime match total. }
+        archived_at: { $ref: '#/components/schemas/Timestamp' }
+        mail_account_id: { type: string, format: uuid }
+        mail_account:
+          $ref: '#/components/schemas/MailAccountResponse'
+          description: Included on single-watcher reads.
+        filters:
+          type: array
+          items: { $ref: '#/components/schemas/WatcherFilterResponse' }
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/WatcherEventResponse' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+      required:
+        [id, name, status, match_mode, folder, cooldown_seconds, match_count,
+         mail_account_id, created_at, updated_at]
+
+    WatcherFilterResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        field: { $ref: '#/components/schemas/FilterField' }
+        header_name: { type: string, description: 'Which header to read, when `field` is `header`.' }
+        operator: { $ref: '#/components/schemas/FilterOperator' }
+        value: { type: string }
+        case_sensitive: { type: boolean }
+        position: { type: integer, description: Evaluation order. }
+      required: [id, field, operator, value, case_sensitive, position]
+
+    WatcherFilterRequest:
+      type: object
+      properties:
+        field: { $ref: '#/components/schemas/FilterField' }
+        header_name:
+          type: string
+          maxLength: 100
+          description: Required when `field` is `header`.
+        operator: { $ref: '#/components/schemas/FilterOperator' }
+        value:
+          type: string
+          description: 'For `size`, a byte count; for `regex`, a Go regular expression.'
+        case_sensitive: { type: boolean, default: false }
+        position: { type: integer }
+      required: [field, operator, value]
+
+    CreateWatcherRequest:
+      type: object
+      properties:
+        mail_account_id:
+          type: string
+          format: uuid
+          description: Must be one of your own accounts. Immutable after creation.
+        name: { type: string, maxLength: 150 }
+        description: { type: string }
+        match_mode:
+          $ref: '#/components/schemas/MatchMode'
+          description: Defaults to `all`.
+        folder: { type: string, maxLength: 255, description: Defaults to the account's inbox. }
+        watch_from:
+          type: [integer, 'null']
+          format: int64
+          description: Unix milliseconds. Omit to start from now.
+        cooldown_seconds: { type: integer, minimum: 0, default: 0 }
+        filters:
+          type: array
+          description: Created with the watcher, in array order.
+          items: { $ref: '#/components/schemas/WatcherFilterRequest' }
+        events:
+          type: array
+          description: Created with the watcher, in array order.
+          items: { $ref: '#/components/schemas/CreateWatcherEventRequest' }
+      required: [mail_account_id, name]
+
+    UpdateWatcherRequest:
+      type: object
+      description: Metadata only. Only the fields present are changed.
+      properties:
+        name: { type: string, maxLength: 150 }
+        description: { type: [string, 'null'] }
+        match_mode: { $ref: '#/components/schemas/MatchMode' }
+        folder: { type: string, maxLength: 255 }
+        cooldown_seconds: { type: [integer, 'null'] }
+
+    ReplaceFiltersRequest:
+      type: object
+      description: Replaces the watcher's entire filter set.
+      properties:
+        match_mode: { $ref: '#/components/schemas/MatchMode' }
+        filters:
+          type: array
+          description: The complete set. Omit or send empty to clear all filters.
+          items: { $ref: '#/components/schemas/WatcherFilterRequest' }
+
+    TestWatcherRequest:
+      type: object
+      properties:
+        sample_size:
+          type: integer
+          minimum: 1
+          maximum: 200
+          description: How many recent messages to scan.
+
+    TestWatcherResponse:
+      type: object
+      properties:
+        scanned: { type: integer }
+        matched: { type: integer }
+        samples:
+          type: array
+          items: { $ref: '#/components/schemas/TestWatcherSample' }
+      required: [scanned, matched, samples]
+
+    TestWatcherSample:
+      type: object
+      properties:
+        subject: { type: string }
+        from_address: { type: string }
+        received_at: { $ref: '#/components/schemas/Timestamp' }
+        matched: { type: boolean }
+        matched_filters:
+          type: array
+          description: Which filters this message satisfied.
+          items: { type: string }
+      required: [subject, from_address, received_at, matched, matched_filters]
+
+    WatcherStatsResponse:
+      type: object
+      properties:
+        total_matches: { type: integer, format: int64 }
+        runs_succeeded: { type: integer, format: int64 }
+        runs_failed: { type: integer, format: int64 }
+        runs_pending: { type: integer, format: int64 }
+        daily:
+          type: array
+          items: { $ref: '#/components/schemas/DailyMatchCount' }
+      required: [total_matches, runs_succeeded, runs_failed, runs_pending, daily]
+
+    DailyMatchCount:
+      type: object
+      properties:
+        date: { type: string, format: date, description: '`YYYY-MM-DD`.' }
+        matches: { type: integer, format: int64 }
+      required: [date, matches]
+
+    # ---- watcher events
+    WatcherEventResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        watcher_id: { type: string, format: uuid }
+        type: { type: string, description: The handler type. Immutable. }
+        config:
+          $ref: '#/components/schemas/JSONObject'
+          description: Per the type's `config_schema`.
+        position: { type: integer, description: Execution order within the watcher. }
+        enabled: { type: boolean }
+        run_mode: { $ref: '#/components/schemas/RunMode' }
+        delay_seconds: { type: integer, description: Applies when `run_mode` is `delayed`. }
+        repeat_interval_seconds: { type: integer, description: Applies when `run_mode` is `recurring`. }
+        repeat_max: { type: integer, description: Stop after this many occurrences. }
+        repeat_until: { $ref: '#/components/schemas/Timestamp' }
+        cron_expression: { type: string }
+        stop_on_ack:
+          type: boolean
+          description: Acknowledging a run cancels the remaining occurrences.
+        notifiers:
+          type: array
+          description: The notifiers this event delivers through.
+          items: { $ref: '#/components/schemas/NotifierResponse' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+      required:
+        [id, watcher_id, type, config, position, enabled, run_mode,
+         delay_seconds, stop_on_ack, created_at, updated_at]
+
+    CreateWatcherEventRequest:
+      type: object
+      properties:
+        type:
+          type: string
+          maxLength: 40
+          description: A `type` from `GET /api/event-types`.
+        config:
+          $ref: '#/components/schemas/JSONObject'
+          description: Must satisfy that type's `config_schema`.
+        position: { type: integer, description: Defaults to the end of the list. }
+        enabled: { type: [boolean, 'null'], description: Defaults to true. }
+        run_mode:
+          $ref: '#/components/schemas/RunMode'
+          description: Defaults to `immediate`.
+        delay_seconds: { type: integer, minimum: 0, default: 0 }
+        repeat_interval_seconds: { type: [integer, 'null'], minimum: 1 }
+        repeat_max: { type: [integer, 'null'], minimum: 1 }
+        repeat_until: { type: [integer, 'null'], format: int64, description: Unix milliseconds. }
+        cron_expression: { type: string, maxLength: 120 }
+        stop_on_ack: { type: boolean, default: false }
+        notifier_ids:
+          type: array
+          description: 'Ignored when the type''s `uses_notifiers` is false. Empty uses your default notifier.'
+          items: { type: string, format: uuid }
+      required: [type]
+
+    UpdateWatcherEventRequest:
+      type: object
+      description: Only the fields present are changed. `type` cannot be changed.
+      properties:
+        config: { $ref: '#/components/schemas/JSONObject' }
+        position: { type: [integer, 'null'] }
+        enabled: { type: [boolean, 'null'] }
+        run_mode: { $ref: '#/components/schemas/RunMode' }
+        delay_seconds: { type: [integer, 'null'] }
+        repeat_interval_seconds: { type: [integer, 'null'], minimum: 1 }
+        repeat_max: { type: [integer, 'null'], minimum: 1 }
+        repeat_until: { type: [integer, 'null'], format: int64 }
+        cron_expression: { type: [string, 'null'], maxLength: 120 }
+        stop_on_ack: { type: [boolean, 'null'] }
+        notifier_ids:
+          type: array
+          description: Replaces the event's notifier set.
+          items: { type: string, format: uuid }
+
+    ReorderWatcherEventRequest:
+      type: object
+      properties:
+        event_ids:
+          type: array
+          minItems: 1
+          description: Every event id, in the order you want them executed.
+          items: { type: string, format: uuid }
+      required: [event_ids]
+
+    TestWatcherEventRequest:
+      type: object
+      properties:
+        matched_email_id:
+          type: string
+          format: uuid
+          description: Which match to run against. Defaults to the watcher's most recent match.
+
+    # ---- activity
+    MatchedEmailResponse:
+      type: object
+      description: One message that satisfied a watcher's filters.
+      properties:
+        id: { type: string, format: uuid }
+        watcher_id: { type: string, format: uuid }
+        watcher_name: { type: string }
+        mail_account_id: { type: string, format: uuid }
+        message_id: { type: string, description: The RFC 5322 Message-ID from the server. }
+        subject: { type: string }
+        from_address: { type: string }
+        from_name: { type: string }
+        to_addresses: { type: string, description: Comma-separated recipient list. }
+        snippet: { type: string, description: Leading plain text of the body. }
+        has_attachment: { type: boolean }
+        size_bytes: { type: integer }
+        received_at: { $ref: '#/components/schemas/Timestamp' }
+        matched_at: { $ref: '#/components/schemas/Timestamp' }
+        matched_filters:
+          $ref: '#/components/schemas/JSONObject'
+          description: Which filters matched, and on what.
+        runs:
+          type: array
+          description: The event runs this match triggered. Included on single reads.
+          items: { $ref: '#/components/schemas/EventRunResponse' }
+      required:
+        [id, watcher_id, mail_account_id, message_id, has_attachment,
+         size_bytes, received_at, matched_at]
+
+    EventRunResponse:
+      type: object
+      description: One execution of one watcher event against one matched email.
+      properties:
+        id: { type: string, format: uuid }
+        matched_email_id: { type: string, format: uuid }
+        watcher_event_id: { type: string, format: uuid }
+        event_type: { type: string }
+        occurrence:
+          type: integer
+          description: Which repetition this is, for a recurring event. Starts at 1.
+        status: { $ref: '#/components/schemas/RunStatus' }
+        scheduled_at: { $ref: '#/components/schemas/Timestamp' }
+        started_at: { $ref: '#/components/schemas/Timestamp' }
+        finished_at: { $ref: '#/components/schemas/Timestamp' }
+        attempt: { type: integer }
+        max_attempts: { type: integer }
+        config_snapshot:
+          $ref: '#/components/schemas/JSONObject'
+          description: |
+            The event's config as it stood when the run was scheduled, so later
+            edits do not rewrite history.
+        result:
+          $ref: '#/components/schemas/JSONObject'
+          description: Handler-specific outcome.
+        error: { type: string, description: Present when `status` is `failed`. }
+        acknowledged_at: { $ref: '#/components/schemas/Timestamp' }
+        deliveries:
+          type: array
+          description: Included on single reads.
+          items: { $ref: '#/components/schemas/DeliveryResponse' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+      required:
+        [id, matched_email_id, watcher_event_id, occurrence, status,
+         scheduled_at, attempt, max_attempts, created_at]
+
+    DeliveryResponse:
+      type: object
+      description: One attempt to push a run's message through one channel.
+      properties:
+        id: { type: string, format: uuid }
+        event_run_id: { type: string, format: uuid }
+        notifier_id: { type: string, format: uuid }
+        channel_type: { type: string, description: 'e.g. `telegram`.' }
+        status: { $ref: '#/components/schemas/DeliveryStatus' }
+        rendered_message: { type: string, description: What was actually sent. }
+        provider_message_id: { type: string, description: The channel's own id for the message. }
+        error: { type: string }
+        sent_at: { $ref: '#/components/schemas/Timestamp' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+      required: [id, event_run_id, channel_type, status, created_at]
+
+    CancelRunResponse:
+      type: object
+      properties:
+        cancelled: { type: integer, format: int64, description: How many pending runs were cancelled. }
+      required: [cancelled]
+
+    AckRunResponse:
+      type: object
+      properties:
+        acknowledged_at: { $ref: '#/components/schemas/Timestamp' }
+        cancelled_occurrences:
+          type: integer
+          format: int64
+          description: Remaining occurrences stopped, when the event has `stop_on_ack`.
+      required: [acknowledged_at, cancelled_occurrences]
+
+    DashboardSummaryResponse:
+      type: object
+      properties:
+        watchers: { $ref: '#/components/schemas/StatusCounts' }
+        mail_accounts: { $ref: '#/components/schemas/StatusCounts' }
+        notifiers: { $ref: '#/components/schemas/StatusCounts' }
+        matches_24h: { type: integer, format: int64 }
+        runs_failed_24h: { type: integer, format: int64 }
+        recent:
+          type: array
+          items: { $ref: '#/components/schemas/RecentActivity' }
+      required:
+        [watchers, mail_accounts, notifiers, matches_24h, runs_failed_24h, recent]
+
+    RecentActivity:
+      type: object
+      properties:
+        type: { type: string, description: 'What kind of row this is, e.g. `match` or `run`.' }
+        id: { type: string, format: uuid }
+        watcher_name: { type: string }
+        subject: { type: string }
+        status: { type: string }
+        at: { $ref: '#/components/schemas/Timestamp' }
+      required: [type, id, at]
+
+    # ---- admin
+    AdminUserResponse:
+      allOf:
+        - $ref: '#/components/schemas/UserResponse'
+        - type: object
+          properties:
+            counts: { $ref: '#/components/schemas/AdminUserCounts' }
+          required: [counts]
+
+    AdminUserCounts:
+      type: object
+      description: What this user owns, for the admin list.
+      properties:
+        watchers: { type: integer, format: int64 }
+        mail_accounts: { type: integer, format: int64 }
+        notifiers: { type: integer, format: int64 }
+        matches: { type: integer, format: int64 }
+      required: [watchers, mail_accounts, notifiers, matches]
+
+    UpdateAdminUserRequest:
+      type: object
+      properties:
+        roles:
+          type: array
+          description: Replaces the user's role set. Evicts their cached sessions.
+          items: { $ref: '#/components/schemas/RoleSlug' }
+        name: { type: string, maxLength: 100 }
+
+    SuspendUserResponse:
+      type: object
+      properties:
+        status: { $ref: '#/components/schemas/UserStatus' }
+        watchers_paused: { type: integer, format: int64 }
+      required: [status, watchers_paused]
+
+    ImpersonateResponse:
+      type: object
+      properties:
+        token: { type: string, description: Bearer token acting as the target user. }
+        expires_at: { $ref: '#/components/schemas/Timestamp' }
+        impersonating:
+          $ref: '#/components/schemas/UserResponse'
+          description: Who this token acts as.
+      required: [token, expires_at, impersonating]
+
+    AdminStatsResponse:
+      type: object
+      properties:
+        users: { $ref: '#/components/schemas/StatusCounts' }
+        watchers_active: { type: integer, format: int64 }
+        mail_accounts_error:
+          type: integer
+          format: int64
+          description: Accounts whose last credential check failed.
+        queue: { $ref: '#/components/schemas/QueueStats' }
+        runs_24h: { $ref: '#/components/schemas/StatusCounts' }
+      required: [users, watchers_active, mail_accounts_error, queue, runs_24h]
+
+    QueueStats:
+      type: object
+      description: Dispatch backlog. A rising `oldest_pending_seconds` means the worker is behind.
+      properties:
+        pending_runs: { type: integer, format: int64 }
+        overdue_runs:
+          type: integer
+          format: int64
+          description: Pending runs whose `scheduled_at` has already passed.
+        oldest_pending_seconds: { type: integer, format: int64 }
+      required: [pending_runs, overdue_runs, oldest_pending_seconds]
+
+    AuditLogResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        actor_user_id:
+          type: string
+          format: uuid
+          description: The real actor, even during an impersonated session.
+        actor_email: { type: string, format: email }
+        impersonated_user_id:
+          type: string
+          format: uuid
+          description: Who the actor was acting as, when the session was impersonated.
+        action: { type: string, description: 'Action slug, e.g. `user.suspend`.' }
+        entity_type: { type: string, description: 'e.g. `watcher`.' }
+        entity_id: { type: string, format: uuid }
+        metadata:
+          $ref: '#/components/schemas/JSONObject'
+          description: Action-specific detail, such as the before/after of a change.
+        ip: { type: string, description: 'Peer address, or the forwarded one when behind a trusted proxy.' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+      required: [id, action, entity_type, created_at]

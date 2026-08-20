@@ -164,6 +164,7 @@ func Bootstrap(config *BootstrapConfig) *Container {
 	catalogController := http.NewCatalogController(catalogUseCase, config.Log)
 	adminController := http.NewAdminController(adminUseCase, activityUseCase, audit,
 		watcherUseCase, mailAccountUseCase, notifierUseCase, config.Log)
+	docsController := http.NewDocsController()
 
 	// ---------------------------------------------------------------- routes
 	routeConfig := route.RouteConfig{
@@ -176,6 +177,8 @@ func Bootstrap(config *BootstrapConfig) *Container {
 		ActivityController:     activityController,
 		AdminController:        adminController,
 		CatalogController:      catalogController,
+		DocsController:         docsController,
+		DocsEnabled:            config.Config.GetBool("web.docs_enabled"),
 		AuthMiddleware:         middleware.NewAuth(userUseCase),
 		LoginRateLimit: middleware.NewRateLimit(rateLimiter, "login",
 			config.Config.GetInt("security.ratelimit.login.attempts"),
