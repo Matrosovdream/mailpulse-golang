@@ -33,9 +33,13 @@ type RouteConfig struct {
 
 	// when false the docs routes are not registered at all; see SetupDocsRoute
 	DocsEnabled bool
+
+	// browser origins allowed to read responses; empty disables CORS entirely
+	CORSOrigins []string
 }
 
 func (c *RouteConfig) Setup() {
+	c.SetupCORS()
 	c.SetupPublicRoute()
 	c.SetupDocsRoute()
 	c.SetupAuthRoute()
@@ -56,6 +60,25 @@ func (c *RouteConfig) SetupDocsRoute() {
 
 	c.App.Get("/api/openapi.yaml", c.DocsController.Spec)
 	c.App.Get("/api/docs", c.DocsController.UI)
+}
+
+// SetupCORS mounts the CORS middleware, and must run before every other group.
+//
+// Ordering is the whole point. A browser sends its preflight OPTIONS without
+// the Authorization header, so if the /api group's auth middleware is reached
+// first it answers 401 and the real request is never sent — the API looks
+// broken from a browser while working perfectly from curl. Mounted here, the
+// preflight is answered 204 and short-circuited before auth sees it.
+//
+// No configured origins means no middleware at all rather than a permissive
+// default: fiber reads an empty AllowOrigins as "*", so passing the empty value
+// through would publish the API to every origin on the internet.
+func (c *RouteConfig) SetupCORS() {
+	if len(c.CORSOrigins) == 0 {
+		return
+	}
+
+	c.App.Use(middleware.NewCORS(c.CORSOrigins))
 }
 
 // SetupPublicRoute is everything reachable without a token.

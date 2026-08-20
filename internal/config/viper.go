@@ -52,6 +52,11 @@ func setDefaults(config *viper.Viper) {
 	// default: trusting the header unconditionally lets any caller claim any IP
 	// and defeats both the rate limiter and the audit trail.
 	config.SetDefault("web.trusted_proxies", "")
+	// CSV of browser origins allowed to read responses, e.g.
+	// http://localhost:5173. Empty means no CORS middleware is mounted at all,
+	// which is the safe default: fiber reads an empty allowlist as "*", so the
+	// choice is deliberately between named origins and none, never a wildcard.
+	config.SetDefault("web.cors_origins", "")
 	// serves GET /api/docs and GET /api/openapi.yaml, both unauthenticated.
 	// On by default because the description is how the API is meant to be read;
 	// turn it off where naming every endpoint to an anonymous caller is not

@@ -179,6 +179,7 @@ func Bootstrap(config *BootstrapConfig) *Container {
 		CatalogController:      catalogController,
 		DocsController:         docsController,
 		DocsEnabled:            config.Config.GetBool("web.docs_enabled"),
+		CORSOrigins:            splitAndTrim(config.Config.GetString("web.cors_origins")),
 		AuthMiddleware:         middleware.NewAuth(userUseCase),
 		LoginRateLimit: middleware.NewRateLimit(rateLimiter, "login",
 			config.Config.GetInt("security.ratelimit.login.attempts"),
