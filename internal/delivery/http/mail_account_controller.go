@@ -163,15 +163,21 @@ func (c *MailAccountController) OAuthAuthorize(ctx *fiber.Ctx) error {
 	return ctx.JSON(model.WebResponse[*model.OAuthAuthorizeResponse]{Data: response})
 }
 
+// OAuthCallback is reached by the provider's redirect, so it answers with a
+// redirect of its own rather than JSON: the thing on the other end is a
+// browser following a chain, not a client waiting on a response body.
 func (c *MailAccountController) OAuthCallback(ctx *fiber.Ctx) error {
 	response, err := c.UseCase.Callback(ctx.UserContext(), &model.OAuthCallbackRequest{
 		Provider: ctx.Params("provider"),
 		Code:     ctx.Query("code"),
 		State:    ctx.Query("state"),
+		// every provider reports a refusal as error=access_denied; anything
+		// else in that parameter is a failure rather than a decision
+		Denied: ctx.Query("error") == "access_denied",
 	})
 	if err != nil {
 		return err
 	}
 
-	return ctx.JSON(model.WebResponse[*model.MailAccountResponse]{Data: response})
+	return ctx.Redirect(response.RedirectURL, fiber.StatusFound)
 }

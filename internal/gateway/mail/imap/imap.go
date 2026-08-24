@@ -48,7 +48,7 @@ func (p *IMAPProvider) Describe() mail.Descriptor {
 	return mail.Descriptor{
 		Kind:      mail.KindIMAP,
 		Label:     "IMAP",
-		AuthModes: []string{mail.AuthPassword, mail.AuthAppPassword},
+		AuthModes: []string{mail.AuthPassword, mail.AuthAppPassword, mail.AuthXOAuth2},
 		Capabilities: mail.Capabilities{
 			Folders:      true,
 			Idle:         true,
@@ -131,11 +131,25 @@ func (p *IMAPProvider) connect(account mail.Account) (*client.Client, error) {
 		username = account.EmailAddress
 	}
 
-	// XOAUTH2 is IMAP transport with an OAuth token; it belongs here rather
-	// than in a separate provider, but the SASL mechanism is not wired yet
+	// XOAUTH2 is IMAP transport carrying an OAuth token, so it belongs here
+	// rather than in a separate provider: everything below this line — the
+	// cursor, the fetch, the MIME handling — is identical either way.
 	if account.AuthMode == mail.AuthOAuth2 || account.AuthMode == mail.AuthXOAuth2 {
-		_ = connection.Logout()
-		return nil, fmt.Errorf("imap: %s is not implemented yet, use an app password", account.AuthMode)
+		if account.Credentials.AccessToken == "" {
+			_ = connection.Logout()
+			return nil, fmt.Errorf("imap: %s has no access token stored, reconnect the mailbox",
+				account.EmailAddress)
+		}
+
+		// XOAUTH2 needs the mailbox address, not the IMAP login name: the token
+		// was issued to an identity, and providers check the two agree.
+		if err := connection.Authenticate(NewXOAuth2(account.EmailAddress, account.Credentials.AccessToken)); err != nil {
+			_ = connection.Logout()
+			return nil, fmt.Errorf("imap: token authentication failed for %s: %w",
+				account.EmailAddress, err)
+		}
+
+		return connection, nil
 	}
 
 	if err := connection.Login(username, account.Credentials.Password); err != nil {

@@ -43,6 +43,20 @@ including a field the front end needs.
 `pipeline_test.go` is the widest: it delivers real mail over SMTP, syncs it
 over IMAP, and follows the match through scheduling, dispatch and delivery.
 
+`oauth_test.go` is the one exception to "nothing is stubbed", and only at the
+edge. A consent screen cannot be automated and a registered application takes
+weeks to approve, so the harness starts a fake provider (`oauth_stub.go`) and
+points the `yandex` slug at it through `OAUTH_STUB_URL`. Everything below the
+endpoints — the exchange, the identity lookup, the encryption, the refresh, the
+merge — is the production path. Tests change what the stub answers through
+`h.OAuth.Configure`, and `h.OAuth.Counts()` is how "exactly one refresh" is
+asserted.
+
+Two things it deliberately does not claim: no real provider has been contacted,
+and GreenMail advertises no SASL mechanisms, so the XOAUTH2 handshake is covered
+by unit tests in `internal/gateway/mail/imap` while the feature test only proves
+`connect()` takes the token branch rather than falling through to LOGIN.
+
 ## Writing one
 
 `test/support` builds the app once per package and gives you `Register`,

@@ -118,7 +118,7 @@ func (c *PipelineUseCase) SyncAccount(ctx context.Context, account *entity.MailA
 		}
 	}
 
-	provider, target, err := c.Resolver.Resolve(db, account)
+	provider, target, err := c.Resolver.Resolve(ctx, db, account)
 	if err != nil {
 		finish(entity.SyncStatusError, 0, 0, err)
 		return nil, err

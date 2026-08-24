@@ -558,6 +558,9 @@ paths:
         Returns the provider's consent URL to redirect the browser to, plus the
         opaque `state` that ties the callback back to this user. Send the user
         to `redirect_url`; the provider then calls `_callback`.
+
+        The state is single use and expires after `REDIS_TTL_OAUTH_STATE`
+        seconds, so start the flow when the user is ready to complete it.
       operationId: oauthAuthorize
       responses:
         '200':
@@ -570,10 +573,23 @@ paths:
                 properties:
                   data:
                     $ref: '#/components/schemas/OAuthAuthorizeResponse'
-        '400': { $ref: '#/components/responses/BadRequest' }
+        '400':
+          description: |
+            The provider is unknown, is not enabled, or does not connect over
+            OAuth at all — offer the app-password form instead.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '501': { $ref: '#/components/responses/NotImplemented' }
+        '501':
+          description: |
+            The provider could connect over OAuth, but this deployment has no
+            client id and secret configured for it. The message names the
+            app-password fallback.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
         '500': { $ref: '#/components/responses/InternalError' }
 
   /api/mail-accounts/oauth/{provider}/_callback:
@@ -601,24 +617,28 @@ paths:
           description: The value returned by `_authorize`.
           schema: { type: string }
       responses:
-        '200':
-          description: The connected account.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [data]
-                properties:
-                  data:
-                    $ref: '#/components/schemas/MailAccountResponse'
-        '400':
-          description: Missing, unknown, or expired `state`, or the provider rejected the code.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ErrorResponse' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '501': { $ref: '#/components/responses/NotImplemented' }
-        '500': { $ref: '#/components/responses/InternalError' }
+        '302':
+          description: |
+            Always. This endpoint is reached by the provider redirecting a
+            browser, so it answers with another redirect rather than a body
+            nothing would read.
+
+            On success the browser lands on `<APP_BASE_URL>/mail-accounts?connected=1`.
+            On failure it lands on the same page with `?oauth_error=<reason>`,
+            where reason is one of `denied` (the user declined at the consent
+            screen), `invalid` (the provider sent no code or state), `state`
+            (the state was unknown, expired, already spent, or issued for a
+            different provider), `unavailable` (the provider is no longer
+            configured here), `exchange` (the provider refused the code),
+            `identity` (the provider would not say which mailbox this is), or
+            `store` (the connection could not be saved).
+
+            The provider's own error text is deliberately never forwarded: it
+            is attacker-influenced and would end up reflected into the page.
+          headers:
+            Location:
+              description: Where to send the browser next.
+              schema: { type: string, format: uri }
 
   /api/mail-accounts/{accountId}:
     parameters:

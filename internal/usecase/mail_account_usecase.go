@@ -2,13 +2,19 @@ package usecase
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
 	"mailpulse/internal/entity"
+	"mailpulse/internal/gateway/cache"
 	"mailpulse/internal/gateway/mail"
+	"mailpulse/internal/gateway/oauth"
 	"mailpulse/internal/gateway/secret"
 	"mailpulse/internal/model"
 	"mailpulse/internal/model/converter"
@@ -31,9 +37,14 @@ type MailAccountUseCase struct {
 	Watchers     *repository.WatcherRepository
 	SyncRuns     *repository.MailSyncRunRepository
 	Providers    *mail.Registry
+	OAuth        *oauth.Registry
+	States       *cache.OAuthStateCache
 	Cipher       *secret.Cipher
 	Audit        *AuditUseCase
 	Pipeline     *PipelineUseCase
+	// UIBaseURL is where the browser is sent once consent is done. It is the
+	// front end, not this API.
+	UIBaseURL string
 }
 
 func NewMailAccountUseCase(db *gorm.DB, log *logrus.Logger, validate *validator.Validate,
@@ -41,11 +52,13 @@ func NewMailAccountUseCase(db *gorm.DB, log *logrus.Logger, validate *validator.
 	watchers *repository.WatcherRepository,
 	syncRuns *repository.MailSyncRunRepository, providers *mail.Registry,
 	cipher *secret.Cipher, audit *AuditUseCase, pipeline *PipelineUseCase,
-	resolver *MailResolver) *MailAccountUseCase {
+	resolver *MailResolver, oauthClients *oauth.Registry, states *cache.OAuthStateCache,
+	uiBaseURL string) *MailAccountUseCase {
 	return &MailAccountUseCase{
 		DB: db, Log: log, Validate: validate, Resolver: resolver,
 		Accounts: accounts, ProviderRows: mailProviders, Watchers: watchers, SyncRuns: syncRuns,
 		Providers: providers, Cipher: cipher, Audit: audit, Pipeline: pipeline,
+		OAuth: oauthClients, States: states, UIBaseURL: uiBaseURL,
 	}
 }
 
@@ -389,8 +402,8 @@ func (c *MailAccountUseCase) decryptCredentials(account *entity.MailAccount) (mo
 	return c.Resolver.Credentials(account)
 }
 
-func (c *MailAccountUseCase) resolve(db *gorm.DB, account *entity.MailAccount) (mail.Provider, mail.Account, error) {
-	return c.Resolver.Resolve(db, account)
+func (c *MailAccountUseCase) resolve(ctx context.Context, db *gorm.DB, account *entity.MailAccount) (mail.Provider, mail.Account, error) {
+	return c.Resolver.Resolve(ctx, db, account)
 }
 
 func (c *MailAccountUseCase) Verify(ctx context.Context, request *model.GetMailAccountRequest) (*model.VerifyMailAccountResponse, error) {
@@ -402,7 +415,7 @@ func (c *MailAccountUseCase) Verify(ctx context.Context, request *model.GetMailA
 		return nil, err
 	}
 
-	client, target, err := c.resolve(tx, account)
+	client, target, err := c.resolve(ctx, tx, account)
 	if err != nil {
 		return nil, err
 	}
@@ -448,7 +461,7 @@ func (c *MailAccountUseCase) Folders(ctx context.Context, request *model.GetMail
 		return nil, err
 	}
 
-	client, target, err := c.resolve(db, account)
+	client, target, err := c.resolve(ctx, db, account)
 	if err != nil {
 		return nil, err
 	}
@@ -557,7 +570,7 @@ func (c *MailAccountUseCase) reverifyOne(ctx context.Context, db *gorm.DB, accou
 		return cause
 	}
 
-	client, target, err := c.resolve(db, account)
+	client, target, err := c.resolve(ctx, db, account)
 	if err != nil {
 		return fail(err)
 	}
@@ -584,23 +597,232 @@ func (c *MailAccountUseCase) reverifyOne(ctx context.Context, db *gorm.DB, accou
 	return nil
 }
 
-// Authorize returns the consent URL the SPA redirects to. Wiring a real client
-// id and exchanging the code belongs in a provider-specific gateway; the route
-// and the state handshake are here so the flow can be built against it.
+// Authorize returns the consent URL the front end sends the browser to.
 func (c *MailAccountUseCase) Authorize(ctx context.Context, request *model.OAuthAuthorizeRequest) (*model.OAuthAuthorizeResponse, error) {
 	if err := c.Validate.Struct(request); err != nil {
 		return nil, fiber.ErrBadRequest
 	}
 
-	return nil, fiber.NewError(fiber.StatusNotImplemented,
-		"OAuth for "+request.Provider+" is not configured yet: connect the mailbox over IMAP, or set the provider client id and secret")
-}
-
-func (c *MailAccountUseCase) Callback(ctx context.Context, request *model.OAuthCallbackRequest) (*model.MailAccountResponse, error) {
-	if err := c.Validate.Struct(request); err != nil {
-		return nil, fiber.ErrBadRequest
+	client, _, err := c.oauthClient(c.DB.WithContext(ctx), request.Provider)
+	if err != nil {
+		return nil, err
 	}
 
-	return nil, fiber.NewError(fiber.StatusNotImplemented,
-		"OAuth for "+request.Provider+" is not configured yet")
+	state, err := newOAuthState()
+	if err != nil {
+		c.Log.WithError(err).Error("Cannot generate an oauth state")
+		return nil, fiber.ErrInternalServerError
+	}
+
+	// The state has to be readable again when the provider redirects back, and
+	// that request carries no session. If it cannot be stored there is no way
+	// to finish the flow, so this fails loudly rather than sending the user to
+	// a consent screen whose callback is guaranteed to be rejected.
+	if err := c.States.Set(ctx, state, &model.OAuthState{
+		UserID:    request.UserID,
+		Provider:  request.Provider,
+		CreatedAt: time.Now().UnixMilli(),
+	}); err != nil {
+		return nil, fiber.NewError(fiber.StatusServiceUnavailable,
+			"cannot start a connection right now, try again in a moment")
+	}
+
+	return &model.OAuthAuthorizeResponse{
+		RedirectURL: client.AuthorizeURL(state),
+		State:       state,
+	}, nil
+}
+
+// oauthClient resolves a slug to a configured consent flow, and explains which
+// of the three ways it can be unavailable applies.
+func (c *MailAccountUseCase) oauthClient(db *gorm.DB, slug string) (oauth.Client, *entity.MailProvider, error) {
+	provider, err := c.provider(db, slug)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !provider.SupportsAuthMode(mail.AuthXOAuth2) {
+		return nil, nil, fiber.NewError(fiber.StatusBadRequest,
+			fmt.Sprintf("%s does not connect over OAuth, it supports %s", provider.Label, provider.AuthModes))
+	}
+
+	client, ok := c.OAuth.Get(slug)
+	if !ok {
+		return nil, nil, fiber.NewError(fiber.StatusNotImplemented,
+			"OAuth for "+slug+" is not configured yet: connect the mailbox over IMAP, or set the provider client id and secret")
+	}
+
+	return client, provider, nil
+}
+
+// newOAuthState mints the value that ties a callback to the user who started
+// it. It is the only thing standing between an attacker's authorization code
+// and someone else's account, so it comes from crypto/rand and is long enough
+// not to be guessed within its ten minute life.
+func newOAuthState() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+// Callback finishes the flow and sends the browser back to the front end.
+//
+// It answers with a redirect in every case, success or failure. The caller here
+// is the provider's redirect, not our client: there is nothing on the other end
+// that would read a JSON error body, and rendering one leaves the user staring
+// at a bare object. Failures are reported as a short code of our own choosing —
+// never the provider's error text, which is attacker-influenced and would end
+// up reflected into the page.
+func (c *MailAccountUseCase) Callback(ctx context.Context, request *model.OAuthCallbackRequest) (*model.OAuthCallbackResult, error) {
+	if request.Denied {
+		return c.callbackResult("denied"), nil
+	}
+
+	if request.State == "" || request.Code == "" {
+		return c.callbackResult("invalid"), nil
+	}
+
+	state, err := c.States.Consume(ctx, request.State)
+	if err != nil {
+		return c.callbackResult("unavailable"), nil
+	}
+
+	// Missing state covers an expired consent screen, a replayed callback out
+	// of browser history, and a forged one. They are deliberately not told
+	// apart: the answer is the same, and distinguishing them would tell an
+	// attacker which of their guesses was once real.
+	if state == nil || state.Provider != request.Provider {
+		return c.callbackResult("state"), nil
+	}
+
+	db := c.DB.WithContext(ctx)
+
+	client, provider, err := c.oauthClient(db, request.Provider)
+	if err != nil {
+		c.Log.WithError(err).Warnf("Callback for %s cannot be completed", request.Provider)
+		return c.callbackResult("unavailable"), nil
+	}
+
+	tokens, err := client.Exchange(ctx, request.Code)
+	if err != nil {
+		c.Log.WithError(err).Warnf("Failed to exchange the %s authorization code", request.Provider)
+		return c.callbackResult("exchange"), nil
+	}
+
+	identity, err := client.Identify(ctx, tokens)
+	if err != nil {
+		c.Log.WithError(err).Warnf("Failed to read the account identity from %s", request.Provider)
+		return c.callbackResult("identity"), nil
+	}
+
+	if err := c.connect(ctx, state, provider, identity, tokens); err != nil {
+		c.Log.WithError(err).Warnf("Failed to store the %s connection for %s", request.Provider, identity.Email)
+		return c.callbackResult("store"), nil
+	}
+
+	return c.callbackResult(""), nil
+}
+
+// callbackResult builds the redirect back to the front end. An empty reason is
+// success.
+func (c *MailAccountUseCase) callbackResult(reason string) *model.OAuthCallbackResult {
+	base := strings.TrimRight(c.UIBaseURL, "/") + "/mail-accounts"
+
+	if reason == "" {
+		return &model.OAuthCallbackResult{RedirectURL: base + "?connected=1"}
+	}
+
+	return &model.OAuthCallbackResult{RedirectURL: base + "?oauth_error=" + url.QueryEscape(reason)}
+}
+
+// connect creates the mailbox, or re-authorises the one already connected at
+// that address.
+//
+// The address comes from the consent screen rather than a form, so the same
+// person consenting twice has to land on the same row — otherwise every
+// reconnection leaves a duplicate mailbox behind, both polling.
+func (c *MailAccountUseCase) connect(ctx context.Context, state *model.OAuthState,
+	provider *entity.MailProvider, identity oauth.Identity, tokens oauth.Tokens) error {
+
+	email := strings.ToLower(strings.TrimSpace(identity.Email))
+	if email == "" {
+		return errors.New("the provider returned no email address")
+	}
+
+	tx := c.DB.WithContext(ctx).Begin()
+	defer tx.Rollback()
+
+	account := new(entity.MailAccount)
+	err := c.Accounts.FindByUserAndEmail(tx, account, state.UserID, email)
+	existing := err == nil
+
+	if existing && account.Provider != provider.Slug {
+		return fmt.Errorf("%s is already connected as %s", email, account.Provider)
+	}
+
+	// Merge rather than rebuild. An account being re-authorised may hold an
+	// imap username the user typed and that we never return to them, and the
+	// refresh token itself is often absent from a second consent.
+	var credentials model.MailAccountCredentials
+	if existing {
+		credentials, err = c.decryptCredentials(account)
+		if err != nil {
+			return err
+		}
+	}
+
+	credentials.AccessToken = tokens.AccessToken
+	if tokens.RefreshToken != "" {
+		credentials.RefreshToken = tokens.RefreshToken
+	}
+
+	encrypted, err := c.encryptCredentials(credentials)
+	if err != nil {
+		return err
+	}
+
+	settings, err := c.mergeSettings(provider, account.Settings, nil)
+	if err != nil {
+		return err
+	}
+
+	account.Provider = provider.Slug
+	account.EmailAddress = email
+	account.AuthMode = mail.AuthXOAuth2
+	account.Credentials = encrypted
+	account.Settings = settings
+	account.ProviderAccountID = nilIfEmpty(identity.AccountID)
+	account.Scopes = nilIfEmpty(strings.Join(tokens.Scopes, " "))
+	account.LastError = nil
+	// pending, not verified: consent proves the user said yes, not that the
+	// mailbox can actually be opened. The first Verify decides that.
+	account.Status = entity.MailAccountStatusPending
+
+	if tokens.ExpiresAt > 0 {
+		account.TokenExpiresAt = &tokens.ExpiresAt
+	}
+
+	action := "mail_account.reauthorized"
+
+	if !existing {
+		account.ID = uuid.NewString()
+		account.UserID = state.UserID
+		account.SyncState = entity.JSON("{}")
+		account.PollIntervalSeconds = 120
+		account.NextPollAt = time.Now().UnixMilli()
+		action = "mail_account.connected"
+
+		if err := c.Accounts.Create(tx, account); err != nil {
+			return err
+		}
+	} else if err := c.Accounts.Update(tx, account); err != nil {
+		return err
+	}
+
+	c.Audit.Record(ctx, tx, AuditEntry{ActorID: &state.UserID, Action: action,
+		EntityType: "mail_accounts", EntityID: &account.ID})
+
+	return tx.Commit().Error
 }

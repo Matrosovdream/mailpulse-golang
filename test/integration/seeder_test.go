@@ -120,7 +120,7 @@ func TestMailProviderSeederUpserts(t *testing.T) {
 
 	// the migration already seeded these, so an unchanged file is a no-op
 	raw := json.RawMessage(`[
-		{"slug":"yandex","label":"Yandex Mail","kind":"imap","auth_modes":"app_password",
+		{"slug":"yandex","label":"Yandex Mail","kind":"imap","auth_modes":"app_password,xoauth2",
 		 "default_host":"imap.yandex.com","default_port":993,"default_use_tls":true,
 		 "help_url":"https://yandex.com/support/mail/mail-clients/others.html",
 		 "enabled":true,"position":1}
@@ -137,7 +137,7 @@ func TestMailProviderSeederUpserts(t *testing.T) {
 	// changing a value in the file updates the row, which is the point of
 	// making providers data rather than a migration
 	changed := json.RawMessage(`[
-		{"slug":"yandex","label":"Yandex 360","kind":"imap","auth_modes":"app_password",
+		{"slug":"yandex","label":"Yandex 360","kind":"imap","auth_modes":"app_password,xoauth2",
 		 "default_host":"imap.yandex.com","default_port":993,"default_use_tls":true,
 		 "help_url":"https://yandex.com/support/mail/mail-clients/others.html",
 		 "enabled":true,"position":1}

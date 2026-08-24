@@ -251,14 +251,18 @@ func TestDeleteMailAccountBlockedByWatchers(t *testing.T) {
 	assert.Equal(t, http.StatusOK, h.Delete(t, "/api/mail-accounts/"+stored.ID, account.Token).Status)
 }
 
-func TestOAuthIsNotImplementedYet(t *testing.T) {
+// The OAuth flow itself lives in oauth_test.go. What is left here is the
+// promise this file made when the flow was a stub: whatever the answer is, a
+// user who cannot connect over OAuth is told what to do instead rather than
+// being handed a bare failure.
+func TestOAuthFailuresPointAtTheWorkaround(t *testing.T) {
 	h := support.New(t)
 	h.Reset(t)
 	account := h.Register(t, "oauth@example.com", "secret123")
 
+	// gmail is seeded disabled until an application is registered with Google
 	response := h.Get(t, "/api/mail-accounts/oauth/gmail/_authorize", account.Token)
 
-	// a clear 501 pointing at the workaround, rather than a confusing failure
-	assert.Equal(t, http.StatusNotImplemented, response.Status)
-	assert.Contains(t, response.Error(t), "IMAP")
+	assert.Equal(t, http.StatusBadRequest, response.Status)
+	assert.Contains(t, response.Error(t), "not available yet")
 }

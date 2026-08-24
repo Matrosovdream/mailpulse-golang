@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"time"
 
 	"mailpulse/internal/delivery/http"
@@ -12,6 +13,7 @@ import (
 	stubmail "mailpulse/internal/gateway/mail/stub"
 	"mailpulse/internal/gateway/messaging"
 	gwnotifier "mailpulse/internal/gateway/notifier"
+	"mailpulse/internal/gateway/oauth"
 	"mailpulse/internal/gateway/secret"
 	"mailpulse/internal/repository"
 	"mailpulse/internal/usecase"
@@ -70,9 +72,12 @@ func Bootstrap(config *BootstrapConfig) *Container {
 	// ---------------------------------------------------------------- caches
 	authTTL := time.Duration(config.Config.GetInt("redis.ttl.auth")) * time.Second
 	resetTTL := time.Duration(config.Config.GetInt("redis.ttl.password_reset")) * time.Second
+	stateTTL := time.Duration(config.Config.GetInt("redis.ttl.oauth_state")) * time.Second
 	userCache := cache.NewUserCache(config.Redis, config.Log, authTTL)
 	resetCache := cache.NewPasswordResetCache(config.Redis, config.Log, resetTTL)
+	oauthStates := cache.NewOAuthStateCache(config.Redis, config.Log, stateTTL)
 	rateLimiter := cache.NewRateLimiter(config.Redis, config.Log)
+	locks := cache.NewLock(config.Redis, config.Log)
 
 	// ---------------------------------------------------------------- producers
 	var userProducer *messaging.UserProducer
@@ -106,6 +111,41 @@ func Bootstrap(config *BootstrapConfig) *Container {
 	// Clients are registered by kind. Which providers a user may pick, and the
 	// host/port presets they get, are rows in mail_providers — so adding
 	// Fastmail is a seed row, not a code change.
+	// OAuth clients are keyed by provider slug, not by kind: which consent
+	// screen a mailbox uses is a property of the service, and gmail, outlook
+	// and yandex all sit on the imap kind. A provider whose id and secret are
+	// unset registers nothing, which is what makes _authorize answer 501 for it
+	// instead of sending the user to a screen that would turn them away.
+	callbackBase := config.Config.GetString("oauth.callback_base_url")
+	oauthClients := oauth.NewRegistry()
+	oauthClients.Register(
+		oauth.NewGoogle(oauth.Config{
+			ClientID:     config.Config.GetString("oauth.google.client_id"),
+			ClientSecret: config.Config.GetString("oauth.google.client_secret"),
+		}, callbackBase),
+		oauth.NewMicrosoft(oauth.Config{
+			ClientID:     config.Config.GetString("oauth.microsoft.client_id"),
+			ClientSecret: config.Config.GetString("oauth.microsoft.client_secret"),
+			Tenant:       config.Config.GetString("oauth.microsoft.tenant"),
+		}, callbackBase),
+		oauth.NewYandex(oauth.Config{
+			ClientID:     config.Config.GetString("oauth.yandex.client_id"),
+			ClientSecret: config.Config.GetString("oauth.yandex.client_secret"),
+		}, callbackBase),
+	)
+	// development and test escape hatch: run the whole flow against a server we
+	// control, because a real one needs an app registration that takes weeks to
+	// approve. Only the endpoints are faked; the exchange, refresh and storage
+	// below are the production path.
+	if stubURL := config.Config.GetString("oauth.stub_url"); stubURL != "" {
+		config.Log.Warnf("OAUTH_STUB_URL is set: yandex OAuth is faked against %s, no real provider is contacted", stubURL)
+		oauthClients.Register(oauth.NewStub(oauth.YandexSlug, stubURL))
+	}
+
+	if slugs := oauthClients.Slugs(); len(slugs) > 0 {
+		config.Log.Infof("OAuth is configured for %s", strings.Join(slugs, ", "))
+	}
+
 	providers := mail.NewRegistry()
 	if config.Config.GetBool("mail.stub_enabled") {
 		// development escape hatch: synthesises messages instead of connecting
@@ -123,7 +163,8 @@ func Bootstrap(config *BootstrapConfig) *Container {
 	userUseCase := usecase.NewUserUseCase(config.DB, config.Log, config.Validate,
 		users, roles, sessions, audit, userProducer, userCache, resetCache, sessionTTL)
 
-	mailResolver := usecase.NewMailResolver(mailProviders, providers, cipher)
+	mailResolver := usecase.NewMailResolver(config.DB, mailProviders, accounts, providers,
+		oauthClients, cipher, locks, config.Log)
 
 	pipeline := usecase.NewPipelineUseCase(config.DB, config.Log, accounts, watchers,
 		filters, watcherEvents, matches, runs, syncRuns, providers, cipher, mailResolver)
@@ -132,7 +173,8 @@ func Bootstrap(config *BootstrapConfig) *Container {
 		matches, watchers, watcherEvents, handlers)
 
 	mailAccountUseCase := usecase.NewMailAccountUseCase(config.DB, config.Log, config.Validate,
-		accounts, mailProviders, watchers, syncRuns, providers, cipher, audit, pipeline, mailResolver)
+		accounts, mailProviders, watchers, syncRuns, providers, cipher, audit, pipeline, mailResolver,
+		oauthClients, oauthStates, baseURL)
 
 	notifierUseCase := usecase.NewNotifierUseCase(config.DB, config.Log, config.Validate,
 		notifiers, channels, cipher, audit)

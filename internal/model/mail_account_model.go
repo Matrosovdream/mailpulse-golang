@@ -98,10 +98,38 @@ type OAuthAuthorizeResponse struct {
 	State       string `json:"state"`
 }
 
+// OAuthCallbackRequest carries what the provider put on the query string.
+//
+// Code is not required by the validator: a user who declines consent is sent
+// back with error= and no code at all, and that is a redirect to the UI with a
+// reason on it, not a 400 rendered into the browser.
 type OAuthCallbackRequest struct {
 	Provider string `json:"-" validate:"required,max=40"`
-	Code     string `json:"-" validate:"required"`
-	State    string `json:"-" validate:"required"`
+	Code     string `json:"-"`
+	State    string `json:"-"`
+	// Denied is set when the provider reported the user refused, so the
+	// callback can tell "you said no" apart from "something broke".
+	Denied bool `json:"-"`
+}
+
+// OAuthCallbackResult is where to send the browser next. The callback is
+// reached by a redirect from the provider, so its answer is a redirect too —
+// there is no client listening for JSON on this route.
+type OAuthCallbackResult struct {
+	RedirectURL string `json:"redirect_url"`
+}
+
+// OAuthState is the short-lived record tying a consent screen back to the user
+// who started it. It lives in redis, never in the database: it is worthless
+// after ten minutes and worthless after a restart.
+type OAuthState struct {
+	UserID   string `json:"user_id"`
+	Provider string `json:"provider"`
+	// AccountID is empty for a first connection. Re-authorising an existing
+	// mailbox fills it so the callback updates that row instead of matching on
+	// the address the provider hands back.
+	AccountID string `json:"account_id,omitempty"`
+	CreatedAt int64  `json:"created_at"`
 }
 
 // MailAccountCredentials is what gets encrypted into mail_accounts.credentials.

@@ -32,6 +32,14 @@ func (r *MailAccountRepository) Search(db *gorm.DB, userID, status, provider str
 	return tx.Order("created_at DESC")
 }
 
+// FindByUserAndEmail is how an OAuth callback decides between connecting a new
+// mailbox and re-authorising one that is already here. The address comes from
+// the consent screen rather than from a form, so the same user consenting twice
+// must land on the same row instead of creating a duplicate.
+func (r *MailAccountRepository) FindByUserAndEmail(db *gorm.DB, account *entity.MailAccount, userID, email string) error {
+	return db.Where("user_id = ? AND email_address = ?", userID, email).Take(account).Error
+}
+
 func (r *MailAccountRepository) CountByEmail(db *gorm.DB, userID, email string) (int64, error) {
 	var total int64
 	err := db.Model(&entity.MailAccount{}).

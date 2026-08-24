@@ -81,6 +81,30 @@ func setDefaults(config *viper.Viper) {
 
 	config.SetDefault("session.ttl", 604800) // 7 days
 
+	// OAuth client credentials, one pair per mail_providers slug. There is
+	// deliberately no default: a provider whose id and secret are unset is
+	// never registered, so _authorize answers 501 and says to use an app
+	// password rather than sending the user to a consent screen that will
+	// reject them.
+	config.SetDefault("oauth.google.client_id", "")
+	config.SetDefault("oauth.google.client_secret", "")
+	config.SetDefault("oauth.microsoft.client_id", "")
+	config.SetDefault("oauth.microsoft.client_secret", "")
+	// "common" admits both work/school and personal accounts; a single-tenant
+	// app registration must name its own directory id here
+	config.SetDefault("oauth.microsoft.tenant", "common")
+	config.SetDefault("oauth.yandex.client_id", "")
+	config.SetDefault("oauth.yandex.client_secret", "")
+	// This API's own public origin, which is what the provider redirects back
+	// to. It is not app.base_url: that one is where the browser is sent
+	// afterwards, and in any real deployment the UI and the API are different
+	// hosts. The registered redirect_uri must match this byte for byte.
+	config.SetDefault("oauth.callback_base_url", "http://localhost:3000")
+	// development and test only: point the yandex flow at a fake provider so
+	// the consent handshake can be exercised without a registered application.
+	// Empty means off, and the server warns loudly when it is not.
+	config.SetDefault("oauth.stub_url", "")
+
 	config.SetDefault("worker.poll_interval", 30)
 	config.SetDefault("worker.poll_batch", 20)
 	config.SetDefault("worker.dispatch_interval", 5)
@@ -125,6 +149,8 @@ func setDefaults(config *viper.Viper) {
 	config.SetDefault("redis.pool.size", 10)
 	config.SetDefault("redis.ttl.auth", 300)
 	config.SetDefault("redis.ttl.password_reset", 1800)
+	// how long a consent screen may sit open before the callback is refused
+	config.SetDefault("redis.ttl.oauth_state", 600)
 
 	config.SetDefault("kafka.bootstrap.servers", "localhost:9092")
 	config.SetDefault("kafka.group.id", "mailpulse")

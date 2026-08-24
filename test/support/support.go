@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 
@@ -38,6 +39,9 @@ type Harness struct {
 	Log       *logrus.Logger
 	Validate  *validator.Validate
 	Container *config.Container
+	// OAuth is the fake provider the yandex slug is wired to for the duration
+	// of the run. Tests change what it answers; nothing else touches it.
+	OAuth *OAuthStub
 }
 
 var (
@@ -50,6 +54,13 @@ func New(t *testing.T) *Harness {
 	t.Helper()
 
 	once.Do(func() {
+		// The fake provider has to exist before the container is wired: its
+		// address is what the oauth client is built around. os.Setenv rather
+		// than t.Setenv because the harness outlives the test that happened to
+		// build it, and t.Setenv would unset this again at that test's end.
+		oauthStub := newOAuthStub()
+		os.Setenv("OAUTH_STUB_URL", oauthStub.Server.URL)
+
 		viperConfig := config.NewViper()
 
 		log := config.NewLogger(viperConfig)
@@ -74,7 +85,7 @@ func New(t *testing.T) *Harness {
 
 		shared = &Harness{
 			App: app, DB: db, Redis: redisClient, Config: viperConfig,
-			Log: log, Validate: validate, Container: container,
+			Log: log, Validate: validate, Container: container, OAuth: oauthStub,
 		}
 	})
 
@@ -107,14 +118,38 @@ func (h *Harness) Reset(t *testing.T) {
 	if err == nil && len(limits) > 0 {
 		h.Redis.Del(ctx, limits...)
 	}
+
+	// a pending consent handshake from a previous test would otherwise still be
+	// redeemable, and the refresh locks would still be held
+	states, err := h.Redis.Keys(ctx, "oauth:state:*").Result()
+	if err == nil && len(states) > 0 {
+		h.Redis.Del(ctx, states...)
+	}
+
+	locks, err := h.Redis.Keys(ctx, "lock:*").Result()
+	if err == nil && len(locks) > 0 {
+		h.Redis.Del(ctx, locks...)
+	}
+
+	if h.OAuth != nil {
+		h.OAuth.Reset()
+	}
 }
 
 // ---------------------------------------------------------------- HTTP
 
-// Response is a decoded API response, which is always the same envelope.
+// Response is a decoded API response, which is always the same envelope —
+// except on the routes that redirect, where the answer is in Headers.
 type Response struct {
-	Status int
-	Body   []byte
+	Status  int
+	Body    []byte
+	Headers http.Header
+}
+
+// Location is where a redirect points, for the routes a browser follows rather
+// than a client decoding.
+func (r Response) Location() string {
+	return r.Headers.Get("Location")
 }
 
 // Decode unpacks the "data" member into target.
@@ -190,7 +225,7 @@ func (h *Harness) DoWithHeaders(t *testing.T, method, path, token string, payloa
 		t.Fatalf("could not read the response: %v", err)
 	}
 
-	return Response{Status: response.StatusCode, Body: raw}
+	return Response{Status: response.StatusCode, Body: raw, Headers: response.Header}
 }
 
 func (h *Harness) Get(t *testing.T, path, token string) Response {
