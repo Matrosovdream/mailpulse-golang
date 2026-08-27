@@ -44,6 +44,12 @@ type Container struct {
 	Pipeline     *usecase.PipelineUseCase
 	Dispatcher   *usecase.DispatcherUseCase
 	MailAccounts *usecase.MailAccountUseCase
+
+	// Providers is exposed so a tool can substitute the mail client after
+	// wiring — cmd/loadtest swaps in the load stub, because measuring the
+	// pipeline against a real mailbox measures the mailbox. Nothing in the
+	// web or worker binaries touches it.
+	Providers *mail.Registry
 }
 
 func Bootstrap(config *BootstrapConfig) *Container {
@@ -236,5 +242,6 @@ func Bootstrap(config *BootstrapConfig) *Container {
 		Pipeline:     pipeline,
 		Dispatcher:   dispatcher,
 		MailAccounts: mailAccountUseCase,
+		Providers:    providers,
 	}
 }

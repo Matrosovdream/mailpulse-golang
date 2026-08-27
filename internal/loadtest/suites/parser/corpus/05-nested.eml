@@ -1,0 +1,25 @@
+From: deep@example.com
+To: rcpt@example.com
+Subject: Deeply nested multipart
+Message-Id: <nest-1@example.com>
+Date: Wed, 27 Aug 2026 09:04:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="o1"
+
+--o1
+Content-Type: multipart/related; boundary="o2"
+
+--o2
+Content-Type: multipart/alternative; boundary="o3"
+
+--o3
+Content-Type: text/plain; charset=utf-8
+
+Nested plain text at depth three.
+--o3
+Content-Type: text/html; charset=utf-8
+
+<p>Nested html at depth three.</p>
+--o3--
+--o2--
+--o1--

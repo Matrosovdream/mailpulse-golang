@@ -1,0 +1,19 @@
+From: news@example.com
+To: rcpt@example.com
+Subject: Multipart alternative with base64 HTML
+Message-Id: <mp-1@example.com>
+Date: Wed, 27 Aug 2026 09:02:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="b1"
+
+--b1
+Content-Type: text/plain; charset=utf-8
+
+Plain fallback for the alert.
+--b1
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: base64
+
+PGh0bWw+PGJvZHk+PGgxPkFsZXJ0PC9oMT48cD5Zb3VyIGludm9pY2UgaXMgcmVhZHkuPC9w
+PjwvYm9keT48L2h0bWw+
+--b1--

@@ -1,0 +1,7 @@
+From: broken@example.com
+Subject: Malformed: no MIME version, bad boundary
+Message-Id: <bad-1@example.com>
+Content-Type: multipart/mixed; boundary="nope"
+
+This body never opens the declared boundary, which is what a parser has to
+survive rather than reject.

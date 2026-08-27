@@ -1,0 +1,9 @@
+From: Sender <sender@example.com>
+To: Recipient <rcpt@example.com>
+Subject: Plain ASCII invoice 4471
+Message-Id: <plain-1@example.com>
+Date: Wed, 27 Aug 2026 09:00:00 +0000
+Content-Type: text/plain; charset=utf-8
+
+Your invoice is attached to your account. Total 149.00 EUR.
+This is the cheapest shape the parser sees: one part, no encoding.

@@ -94,6 +94,41 @@ test-integration: ## Repository and seeder tests against the dev database
 test-feature: ## Endpoint tests through the whole app
 	$(DC) exec -T web go test -tags=feature -count=1 ./test/feature/... $(ARGS)
 
+# ---------------------------------------------------------------- load
+# Load suites run inside the web container, like the seeder and the test
+# layers, so they read the same .env and reach postgres by service name.
+# Every target takes ARGS, e.g. make load-worker ARGS="-accounts=2000 -p99=6s"
+.PHONY: load
+load: ## List the load suites and what each one answers
+	$(DC) exec -T web go run ./cmd/loadtest
+
+.PHONY: load-parser
+load-parser: ## MIME parse cost per message shape; needs no database
+	$(DC) exec -T web go run ./cmd/loadtest parser $(ARGS)
+
+.PHONY: load-worker
+load-worker: ## Poller capacity: cycle time against the interval
+	$(DC) exec -T web go run ./cmd/loadtest worker $(ARGS)
+
+.PHONY: load-endpoints
+load-endpoints: ## HTTP endpoint latency under concurrency
+	$(DC) exec -T web go run ./cmd/loadtest endpoints $(ARGS)
+
+.PHONY: load-smoke
+load-smoke: ## The fast pass over every suite, small enough for CI
+	$(DC) exec -T web go run ./cmd/loadtest parser -iterations=200 -quiet
+	$(DC) exec -T web go run ./cmd/loadtest worker -accounts=100 -cycles=5 -quiet
+	$(DC) exec -T web go run ./cmd/loadtest endpoints -users=100 -duration=5s -quiet
+
+# ---------------------------------------------------------------- benchmarks
+# These are the regression signal, and the only part of the load work cheap
+# enough to gate CI on. Compare two runs with benchstat rather than reading
+# absolute numbers, which mean nothing on shared hardware:
+#   make bench > new.txt && benchstat old.txt new.txt
+.PHONY: bench
+bench: ## Run every benchmark (matcher, cipher)
+	go test -run=XXX -bench=. -benchmem ./internal/... $(ARGS)
+
 .PHONY: test-verbose
 test-verbose: ## Every layer with per-test output
 	$(MAKE) test ARGS=-v
