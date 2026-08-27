@@ -630,7 +630,9 @@ paths:
             (the state was unknown, expired, already spent, or issued for a
             different provider), `unavailable` (the provider is no longer
             configured here), `exchange` (the provider refused the code),
-            `identity` (the provider would not say which mailbox this is), or
+            `identity` (the provider would not say which mailbox this is),
+            `mismatch` (a `_reauthorize` came back naming a different mailbox
+            than the one it was started for, so nothing was written), or
             `store` (the connection could not be saved).
 
             The provider's own error text is deliberately never forwarded: it
@@ -756,6 +758,68 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '422': { $ref: '#/components/responses/Unprocessable' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/mail-accounts/{accountId}/_reauthorize:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    post:
+      tags: [Mail Accounts]
+      summary: Reconnect a mailbox through OAuth
+      description: |
+        Restarts consent for a mailbox that already exists, and answers exactly
+        as `_authorize` does: send the browser to `redirect_url`, and the
+        provider then calls `_callback`. This is what a mailbox parked with
+        `status: error` after a revoked grant needs.
+
+        Which provider the user is sent to comes from the account, not from the
+        caller, so there is no `provider` in the path.
+
+        The difference from `_authorize` is what the state carries. Here it
+        names this account, so the callback updates this row rather than
+        matching on the address the provider returns. If the user picks a
+        different mailbox at the consent screen the callback refuses it with
+        `oauth_error=mismatch` and changes nothing — the row's watchers,
+        matches and sync cursor belong to the mailbox it was created for.
+
+        A mailbox still using an app password is accepted, provided its
+        provider supports OAuth: consenting is how such an account stops
+        needing one, and it becomes `xoauth2` when the callback completes.
+      operationId: reauthorizeMailAccount
+      responses:
+        '200':
+          description: Where to send the user, and the state to expect back.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/OAuthAuthorizeResponse'
+        '400':
+          description: |
+            This mailbox's provider does not connect over OAuth, so there is no
+            consent screen to send the user to.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501':
+          description: |
+            The provider could connect over OAuth, but this deployment has no
+            client id and secret configured for it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '503':
+          description: |
+            The state could not be stored, so the flow was not started rather
+            than started with a callback guaranteed to be rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
         '500': { $ref: '#/components/responses/InternalError' }
 
   /api/mail-accounts/{accountId}/folders:

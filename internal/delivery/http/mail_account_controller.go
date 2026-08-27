@@ -163,6 +163,22 @@ func (c *MailAccountController) OAuthAuthorize(ctx *fiber.Ctx) error {
 	return ctx.JSON(model.WebResponse[*model.OAuthAuthorizeResponse]{Data: response})
 }
 
+// OAuthReauthorize restarts consent for a mailbox that already exists, so the
+// user is not asked to retype an address the provider is about to tell us
+// anyway. It is a POST because it mints single-use state as a side effect.
+func (c *MailAccountController) OAuthReauthorize(ctx *fiber.Ctx) error {
+	auth := middleware.GetUser(ctx)
+
+	response, err := c.UseCase.Reauthorize(ctx.UserContext(), &model.OAuthReauthorizeRequest{
+		UserID: auth.ID, ID: ctx.Params("accountId"),
+	})
+	if err != nil {
+		return err
+	}
+
+	return ctx.JSON(model.WebResponse[*model.OAuthAuthorizeResponse]{Data: response})
+}
+
 // OAuthCallback is reached by the provider's redirect, so it answers with a
 // redirect of its own rather than JSON: the thing on the other end is a
 // browser following a chain, not a client waiting on a response body.

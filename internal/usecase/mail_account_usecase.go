@@ -633,6 +633,56 @@ func (c *MailAccountUseCase) Authorize(ctx context.Context, request *model.OAuth
 	}, nil
 }
 
+// Reauthorize restarts consent for a mailbox that is already connected.
+//
+// The difference from Authorize is the pin: the state carries the account id,
+// so the callback updates that row rather than searching for one matching the
+// address the provider hands back. Without the pin, a user who picks the wrong
+// account on the consent screen silently acquires a second mailbox; with it,
+// the mismatch is caught and refused (see connect).
+//
+// A mailbox currently on an app password is allowed through rather than
+// rejected. Consent is exactly how such an account stops needing one, and the
+// provider check below already refuses any provider that cannot do OAuth.
+func (c *MailAccountUseCase) Reauthorize(ctx context.Context, request *model.OAuthReauthorizeRequest) (*model.OAuthAuthorizeResponse, error) {
+	if err := c.Validate.Struct(request); err != nil {
+		return nil, fiber.ErrBadRequest
+	}
+
+	db := c.DB.WithContext(ctx)
+
+	account, err := c.find(db, request.ID, request.UserID)
+	if err != nil {
+		return nil, err
+	}
+
+	client, _, err := c.oauthClient(db, account.Provider)
+	if err != nil {
+		return nil, err
+	}
+
+	state, err := newOAuthState()
+	if err != nil {
+		c.Log.WithError(err).Error("Cannot generate an oauth state")
+		return nil, fiber.ErrInternalServerError
+	}
+
+	if err := c.States.Set(ctx, state, &model.OAuthState{
+		UserID:    request.UserID,
+		Provider:  account.Provider,
+		AccountID: account.ID,
+		CreatedAt: time.Now().UnixMilli(),
+	}); err != nil {
+		return nil, fiber.NewError(fiber.StatusServiceUnavailable,
+			"cannot start a connection right now, try again in a moment")
+	}
+
+	return &model.OAuthAuthorizeResponse{
+		RedirectURL: client.AuthorizeURL(state),
+		State:       state,
+	}, nil
+}
+
 // oauthClient resolves a slug to a configured consent flow, and explains which
 // of the three ways it can be unavailable applies.
 func (c *MailAccountUseCase) oauthClient(db *gorm.DB, slug string) (oauth.Client, *entity.MailProvider, error) {
@@ -718,6 +768,14 @@ func (c *MailAccountUseCase) Callback(ctx context.Context, request *model.OAuthC
 	}
 
 	if err := c.connect(ctx, state, provider, identity, tokens); err != nil {
+		// A reconnection that came back as somebody else is the user's slip,
+		// not a failure, and is worth its own reason: "try again and pick the
+		// mailbox you started from" is advice, where "something broke" is not.
+		if errors.Is(err, errConsentAddressMismatch) {
+			c.Log.WithError(err).Infof("Refused a %s reconnection onto a different mailbox", request.Provider)
+			return c.callbackResult("mismatch"), nil
+		}
+
 		c.Log.WithError(err).Warnf("Failed to store the %s connection for %s", request.Provider, identity.Email)
 		return c.callbackResult("store"), nil
 	}
@@ -737,12 +795,22 @@ func (c *MailAccountUseCase) callbackResult(reason string) *model.OAuthCallbackR
 	return &model.OAuthCallbackResult{RedirectURL: base + "?oauth_error=" + url.QueryEscape(reason)}
 }
 
-// connect creates the mailbox, or re-authorises the one already connected at
-// that address.
+// errConsentAddressMismatch is raised when a re-authorisation comes back
+// carrying a different mailbox than the one it was started for. It is a
+// sentinel rather than a string because Callback has to tell it apart from a
+// storage failure: one is the user's mistake and recoverable by trying again,
+// the other is ours.
+var errConsentAddressMismatch = errors.New("the consent screen returned a different address")
+
+// connect creates the mailbox, or re-authorises one that already exists.
 //
-// The address comes from the consent screen rather than a form, so the same
-// person consenting twice has to land on the same row — otherwise every
-// reconnection leaves a duplicate mailbox behind, both polling.
+// Which row it lands on depends on how the flow was started. From _authorize
+// there is no row yet, so it matches on the address the consent screen
+// returned: that address comes from the provider rather than a form, and the
+// same person consenting twice has to land on the same row — otherwise every
+// reconnection leaves a duplicate mailbox behind, both polling. From
+// _reauthorize the row is already known and travels on the state, so the
+// address is verified instead of searched for.
 func (c *MailAccountUseCase) connect(ctx context.Context, state *model.OAuthState,
 	provider *entity.MailProvider, identity oauth.Identity, tokens oauth.Tokens) error {
 
@@ -755,8 +823,28 @@ func (c *MailAccountUseCase) connect(ctx context.Context, state *model.OAuthStat
 	defer tx.Rollback()
 
 	account := new(entity.MailAccount)
-	err := c.Accounts.FindByUserAndEmail(tx, account, state.UserID, email)
-	existing := err == nil
+	existing := false
+
+	if state.AccountID != "" {
+		// Re-authorisation. The row was chosen before the user ever reached the
+		// consent screen, so it is looked up by id and the address becomes a
+		// check instead of a lookup key.
+		if err := c.Accounts.FindByIdAndUser(tx, account, state.AccountID, state.UserID); err != nil {
+			return fmt.Errorf("the mailbox being reconnected no longer exists: %w", err)
+		}
+		existing = true
+
+		// Picking a different account on the consent screen is an easy slip,
+		// and it must not go through: this row owns watchers, matches and a
+		// sync cursor built from one mailbox, and quietly repointing it at
+		// another would carry all of that across to mail it never saw.
+		if account.EmailAddress != email {
+			return fmt.Errorf("%w: %s was reconnected as %s",
+				errConsentAddressMismatch, account.EmailAddress, email)
+		}
+	} else if err := c.Accounts.FindByUserAndEmail(tx, account, state.UserID, email); err == nil {
+		existing = true
+	}
 
 	if existing && account.Provider != provider.Slug {
 		return fmt.Errorf("%s is already connected as %s", email, account.Provider)
@@ -767,10 +855,11 @@ func (c *MailAccountUseCase) connect(ctx context.Context, state *model.OAuthStat
 	// refresh token itself is often absent from a second consent.
 	var credentials model.MailAccountCredentials
 	if existing {
-		credentials, err = c.decryptCredentials(account)
+		stored, err := c.decryptCredentials(account)
 		if err != nil {
 			return err
 		}
+		credentials = stored
 	}
 
 	credentials.AccessToken = tokens.AccessToken

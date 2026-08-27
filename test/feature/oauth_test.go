@@ -531,3 +531,203 @@ func TestOAuthReconnect(t *testing.T) {
 	assert.Equal(t, "stub-refresh-token", credentials.RefreshToken,
 		"an absent refresh token means keep the old one; overwriting it kills the mailbox an hour later")
 }
+
+// _reauthorize is the same handshake as _authorize with one difference that
+// decides everything downstream: the state carries the account id, so the
+// callback updates the row the user started from instead of hunting for one
+// that matches whatever address came back.
+func TestOAuthReauthorize(t *testing.T) {
+	h := support.New(t)
+	h.Reset(t)
+	user := h.Register(t, "oauth-reauthorize@example.com", "secret123")
+
+	stored := connectOAuthAccount(t, h, user)
+
+	t.Run("needs a session", func(t *testing.T) {
+		response := h.Post(t, "/api/mail-accounts/"+stored.ID+"/_reauthorize", "", nil)
+
+		assert.Equal(t, http.StatusUnauthorized, response.Status,
+			"restarting consent decides whose mailbox the next callback lands on")
+	})
+
+	t.Run("pins the consent to the account", func(t *testing.T) {
+		response := h.Post(t, "/api/mail-accounts/"+stored.ID+"/_reauthorize", user.Token, nil)
+		require.Equal(t, http.StatusOK, response.Status, response.Error(t))
+
+		var restarted authorizeResponse
+		response.Decode(t, &restarted)
+
+		assert.Equal(t, restarted.State, stateOf(t, restarted.RedirectURL),
+			"the state in the URL and the one handed to the client have to be the same value")
+
+		raw, err := h.Redis.Get(context.Background(), "oauth:state:"+restarted.State).Bytes()
+		require.NoError(t, err, "the callback has no session, so the state is the only way back")
+
+		var state model.OAuthState
+		require.NoError(t, json.Unmarshal(raw, &state))
+
+		assert.Equal(t, stored.ID, state.AccountID,
+			"without the id the callback falls back to matching on the address the provider returns")
+		assert.Equal(t, "yandex", state.Provider,
+			"the provider is read off the row, so one mailbox cannot be re-consented through another's flow")
+		assert.Equal(t, user.ID, state.UserID)
+	})
+
+	t.Run("an unknown mailbox is not found", func(t *testing.T) {
+		response := h.Post(t,
+			"/api/mail-accounts/8f1d2c3b-0000-4000-8000-00000000dead/_reauthorize", user.Token, nil)
+
+		assert.Equal(t, http.StatusNotFound, response.Status)
+	})
+
+	t.Run("someone else's mailbox is not found", func(t *testing.T) {
+		other := h.Register(t, "not-my-mailbox@example.com", "secret123")
+
+		response := h.Post(t, "/api/mail-accounts/"+stored.ID+"/_reauthorize", other.Token, nil)
+
+		assert.Equal(t, http.StatusNotFound, response.Status,
+			"a mailbox someone else owns should not be reconnectable, or even confirmable")
+	})
+
+	t.Run("refuses a provider that does not do oauth", func(t *testing.T) {
+		host, port := h.MailHost()
+
+		created := h.Post(t, "/api/mail-accounts", user.Token, map[string]any{
+			"provider": "imap", "email_address": "plain@corp.com",
+			"auth_mode": "password", "username": "demo", "password": "secret123",
+			"settings": support.MailAccountSettings(host, port),
+		})
+		require.Equal(t, http.StatusCreated, created.Status, created.Error(t))
+
+		var plain mailAccount
+		created.Decode(t, &plain)
+
+		response := h.Post(t, "/api/mail-accounts/"+plain.ID+"/_reauthorize", user.Token, nil)
+
+		assert.Equal(t, http.StatusBadRequest, response.Status)
+		assert.Contains(t, response.Error(t), "does not connect over OAuth")
+	})
+
+	// Consent is exactly how a mailbox stops needing an app password, so an
+	// account currently on one is offered the consent screen rather than being
+	// told it is the wrong kind of account.
+	t.Run("offers consent to a mailbox still on an app password", func(t *testing.T) {
+		created := h.Post(t, "/api/mail-accounts", user.Token, map[string]any{
+			"provider": "yandex", "email_address": "app-password@yandex.com", "password": "app-pw",
+		})
+		require.Equal(t, http.StatusCreated, created.Status, created.Error(t))
+
+		var legacy mailAccount
+		created.Decode(t, &legacy)
+		require.Equal(t, "app_password", legacy.AuthMode)
+
+		response := h.Post(t, "/api/mail-accounts/"+legacy.ID+"/_reauthorize", user.Token, nil)
+
+		assert.Equal(t, http.StatusOK, response.Status, response.Error(t))
+	})
+}
+
+// The point of the pin, end to end: a reconnection lands on the row it was
+// started from, and merges rather than rebuilds it.
+func TestOAuthReauthorizeUpdatesTheSameMailbox(t *testing.T) {
+	h := support.New(t)
+	h.Reset(t)
+	user := h.Register(t, "oauth-reconnect@example.com", "secret123")
+
+	original := connectOAuthAccount(t, h, user)
+
+	// park it the way an invalid_grant does, because that is what sends a user
+	// to this button in the first place
+	require.NoError(t, h.DB.Model(&entity.MailAccount{}).
+		Where("id = ?", original.ID).
+		Updates(map[string]any{
+			"status":     entity.MailAccountStatusError,
+			"last_error": "the mailbox must be reconnected",
+		}).Error)
+
+	// a second consent hands back a new access token and no refresh token,
+	// exactly as Google does
+	h.OAuth.Configure(func(c *support.StubConfig) {
+		c.AccessToken = "reauthorized-access-token"
+		c.RefreshToken = ""
+	})
+
+	restarted := h.Post(t, "/api/mail-accounts/"+original.ID+"/_reauthorize", user.Token, nil)
+	require.Equal(t, http.StatusOK, restarted.Status, restarted.Error(t))
+
+	var started authorizeResponse
+	restarted.Decode(t, &started)
+
+	callback := h.Get(t, callbackPath("yandex", "the-code", started.State), "")
+	require.Equal(t, http.StatusFound, callback.Status)
+	require.Empty(t, oauthError(t, callback.Location()), "the callback reported: %s", callback.Location())
+
+	var total int64
+	require.NoError(t, h.DB.Model(&entity.MailAccount{}).Count(&total).Error)
+	assert.Equal(t, int64(1), total, "reconnecting left a duplicate mailbox behind, both polling")
+
+	updated := accountRow(t, h, "connected@yandex.com")
+	assert.Equal(t, original.ID, updated.ID, "the pinned row should have been the one updated")
+
+	assert.Equal(t, entity.MailAccountStatusPending, updated.Status,
+		"a reconnected mailbox goes back to pending; the next verify decides whether it opens")
+	assert.Nil(t, updated.LastError, "the error that sent the user here should not outlive the fix")
+
+	credentials := decryptCredentials(t, h, updated)
+	assert.Equal(t, "reauthorized-access-token", credentials.AccessToken)
+	assert.Equal(t, "stub-refresh-token", credentials.RefreshToken,
+		"an absent refresh token means keep the old one; overwriting it kills the mailbox an hour later")
+
+	// the host the user patched onto the row is not part of the consent screen
+	// and has to survive it
+	host, _ := h.MailHost()
+	var settings map[string]any
+	require.NoError(t, json.Unmarshal(updated.Settings, &settings))
+	assert.Equal(t, host, settings["host"], "reconnecting rebuilt the settings instead of merging into them")
+}
+
+// Picking the wrong account on the consent screen is an easy slip, and the pin
+// is what turns it into a refusal instead of a silent repointing. The row owns
+// watchers, matches and a sync cursor built from one mailbox; carrying all of
+// that across to another is not something to do quietly.
+func TestOAuthReauthorizeRefusesADifferentMailbox(t *testing.T) {
+	h := support.New(t)
+	h.Reset(t)
+	user := h.Register(t, "oauth-mismatch@example.com", "secret123")
+
+	original := connectOAuthAccount(t, h, user)
+
+	h.OAuth.Configure(func(c *support.StubConfig) {
+		c.Email = "someone-else@yandex.com"
+		c.Subject = "stub-subject-2"
+		c.AccessToken = "other-mailbox-access-token"
+	})
+
+	restarted := h.Post(t, "/api/mail-accounts/"+original.ID+"/_reauthorize", user.Token, nil)
+	require.Equal(t, http.StatusOK, restarted.Status, restarted.Error(t))
+
+	var started authorizeResponse
+	restarted.Decode(t, &started)
+
+	callback := h.Get(t, callbackPath("yandex", "the-code", started.State), "")
+	require.Equal(t, http.StatusFound, callback.Status)
+	assert.Equal(t, "mismatch", oauthError(t, callback.Location()),
+		"the user picked the wrong mailbox, which is advice-shaped and not a fault")
+
+	// neither address is leaked back into the page: the reason is ours, and the
+	// only thing on the query string
+	assert.NotContains(t, callback.Location(), "someone-else@yandex.com")
+	assert.NotContains(t, callback.Location(), "connected@yandex.com")
+
+	var total int64
+	require.NoError(t, h.DB.Model(&entity.MailAccount{}).Count(&total).Error)
+	assert.Equal(t, int64(1), total,
+		"a refused reconnection must not connect the other mailbox as a new row either")
+
+	untouched := accountRow(t, h, "connected@yandex.com")
+	assert.Equal(t, original.ID, untouched.ID)
+
+	credentials := decryptCredentials(t, h, untouched)
+	assert.Equal(t, "stub-access-token", credentials.AccessToken,
+		"the mailbox that was not reconnected kept the token it already had")
+}

@@ -98,6 +98,18 @@ type OAuthAuthorizeResponse struct {
 	State       string `json:"state"`
 }
 
+// OAuthReauthorizeRequest restarts consent for a mailbox that is already
+// connected, naming the row rather than the provider: which provider to send
+// the user to is already recorded on the account, and taking it from the
+// caller would let one mailbox be re-consented through another's flow.
+//
+// The answer is an OAuthAuthorizeResponse, because from the client's side this
+// is the same handshake: take the URL, send the browser, wait for the callback.
+type OAuthReauthorizeRequest struct {
+	UserID string `json:"-" validate:"required"`
+	ID     string `json:"-" validate:"required"`
+}
+
 // OAuthCallbackRequest carries what the provider put on the query string.
 //
 // Code is not required by the validator: a user who declines consent is sent

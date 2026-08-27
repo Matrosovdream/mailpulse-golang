@@ -126,6 +126,7 @@ func (c *RouteConfig) SetupAuthRoute() {
 	api.Delete("/mail-accounts/:accountId", c.MailAccountController.Delete)
 	api.Post("/mail-accounts/:accountId/_verify", c.MailAccountController.Verify)
 	api.Post("/mail-accounts/:accountId/_sync", c.MailAccountController.Sync)
+	api.Post("/mail-accounts/:accountId/_reauthorize", c.MailAccountController.OAuthReauthorize)
 	api.Get("/mail-accounts/:accountId/folders", c.MailAccountController.Folders)
 	api.Get("/mail-accounts/:accountId/sync-runs", c.MailAccountController.SyncRuns)
 
