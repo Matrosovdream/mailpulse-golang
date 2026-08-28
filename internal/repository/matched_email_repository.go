@@ -83,6 +83,12 @@ func (r *MatchedEmailRepository) CountForWatcher(db *gorm.DB, watcherID string) 
 	return total, err
 }
 
+// CountForUsers is the same count for a page of users, in one query rather
+// than one per user.
+func (r *MatchedEmailRepository) CountForUsers(db *gorm.DB, userIDs []string) (map[string]int64, error) {
+	return countByUsers(db, &entity.MatchedEmail{}, userIDs)
+}
+
 func (r *MatchedEmailRepository) CountForUser(db *gorm.DB, userID string) (int64, error) {
 	var total int64
 	err := db.Model(&entity.MatchedEmail{}).Where("user_id = ?", userID).Count(&total).Error

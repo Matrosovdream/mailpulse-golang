@@ -1,0 +1,37 @@
+{
+  "suite": "endpoints",
+  "started_at": "2026-08-28T02:50:29.63788768Z",
+  "elapsed": 8325922419,
+  "git_sha": "205fd77",
+  "params": {
+    "accounts_per_user": 2,
+    "base_url": "http://127.0.0.1:3000",
+    "concurrency": 10,
+    "duration": "8s",
+    "page_size": 100,
+    "users": 500
+  },
+  "metrics": [
+    {
+      "name": "admin-users",
+      "stats": {
+        "count": 9670,
+        "errors": 0,
+        "min": 3186417,
+        "p50": 7837833,
+        "p95": 12364916,
+        "p99": 16198208,
+        "max": 64125083,
+        "mean": 8266760,
+        "elapsed": 8001016211,
+        "per_second": 1208.5964763707689
+      },
+      "extra": {
+        "note": "ListUsers calls countsFor inside the row loop: four count queries per row"
+      }
+    }
+  ],
+  "findings": [
+    "slowest at p95: admin-users (12ms) at concurrency 10"
+  ]
+}

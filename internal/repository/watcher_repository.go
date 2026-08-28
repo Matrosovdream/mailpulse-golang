@@ -73,6 +73,12 @@ func (r *WatcherRepository) CountByStatusForUser(db *gorm.DB, userID string) (ma
 	return countByColumn(db.Where("user_id = ?", userID), &entity.Watcher{}, "status")
 }
 
+// CountForUsers is the same count for a page of users, in one query rather
+// than one per user.
+func (r *WatcherRepository) CountForUsers(db *gorm.DB, userIDs []string) (map[string]int64, error) {
+	return countByUsers(db, &entity.Watcher{}, userIDs)
+}
+
 func (r *WatcherRepository) CountForUser(db *gorm.DB, userID string) (int64, error) {
 	var total int64
 	err := db.Model(&entity.Watcher{}).Where("user_id = ?", userID).Count(&total).Error

@@ -160,7 +160,7 @@ func (s *Suite) targets(email, password string) []target {
 	return []target{
 		{
 			name: "admin-users", path: "/api/admin/users" + page, method: http.MethodGet, auth: true,
-			note: "ListUsers calls countsFor inside the row loop: four count queries per row",
+			note: "the heaviest list: four grouped counts per page on top of the page query",
 		},
 		{name: "dashboard-summary", path: "/api/dashboard/summary", method: http.MethodGet, auth: true},
 		{name: "matches", path: "/api/matches" + page, method: http.MethodGet, auth: true},

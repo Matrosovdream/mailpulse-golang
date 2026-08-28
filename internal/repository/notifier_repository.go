@@ -82,6 +82,12 @@ func (r *NotifierRepository) CountByStatus(db *gorm.DB) (map[string]int64, error
 	return countByColumn(db, &entity.Notifier{}, "status")
 }
 
+// CountForUsers is the same count for a page of users, in one query rather
+// than one per user.
+func (r *NotifierRepository) CountForUsers(db *gorm.DB, userIDs []string) (map[string]int64, error) {
+	return countByUsers(db, &entity.Notifier{}, userIDs)
+}
+
 func (r *NotifierRepository) CountForUser(db *gorm.DB, userID string) (int64, error) {
 	var total int64
 	err := db.Model(&entity.Notifier{}).Where("user_id = ?", userID).Count(&total).Error

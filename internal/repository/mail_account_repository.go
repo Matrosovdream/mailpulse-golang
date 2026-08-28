@@ -79,6 +79,12 @@ func (r *MailAccountRepository) CountByStatus(db *gorm.DB) (map[string]int64, er
 	return countByColumn(db, &entity.MailAccount{}, "status")
 }
 
+// CountForUsers is the same count for a page of users, in one query rather
+// than one per user.
+func (r *MailAccountRepository) CountForUsers(db *gorm.DB, userIDs []string) (map[string]int64, error) {
+	return countByUsers(db, &entity.MailAccount{}, userIDs)
+}
+
 func (r *MailAccountRepository) CountForUser(db *gorm.DB, userID string) (int64, error) {
 	var total int64
 	err := db.Model(&entity.MailAccount{}).Where("user_id = ?", userID).Count(&total).Error
