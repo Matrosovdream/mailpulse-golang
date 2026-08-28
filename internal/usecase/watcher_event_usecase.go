@@ -26,6 +26,7 @@ type WatcherEventUseCase struct {
 	Notifiers  *repository.NotifierRepository
 	Matches    *repository.MatchedEmailRepository
 	Runs       *repository.EventRunRepository
+	Deliveries *repository.NotificationDeliveryRepository
 	Handlers   *event.Registry
 	Dispatcher *DispatcherUseCase
 	Audit      *AuditUseCase
@@ -34,18 +35,14 @@ type WatcherEventUseCase struct {
 func NewWatcherEventUseCase(db *gorm.DB, log *logrus.Logger, validate *validator.Validate,
 	watchers *repository.WatcherRepository, events *repository.WatcherEventRepository,
 	notifiers *repository.NotifierRepository, matches *repository.MatchedEmailRepository,
-	runs *repository.EventRunRepository, handlers *event.Registry, audit *AuditUseCase) *WatcherEventUseCase {
+	runs *repository.EventRunRepository, deliveries *repository.NotificationDeliveryRepository,
+	handlers *event.Registry, dispatcher *DispatcherUseCase, audit *AuditUseCase) *WatcherEventUseCase {
 	return &WatcherEventUseCase{
 		DB: db, Log: log, Validate: validate,
 		Watchers: watchers, Events: events, Notifiers: notifiers,
-		Matches: matches, Runs: runs, Handlers: handlers, Audit: audit,
+		Matches: matches, Runs: runs, Deliveries: deliveries,
+		Handlers: handlers, Dispatcher: dispatcher, Audit: audit,
 	}
-}
-
-// SetDispatcher closes the loop between this usecase and the dispatcher, which
-// needs the event registry this usecase also holds.
-func (c *WatcherEventUseCase) SetDispatcher(dispatcher *DispatcherUseCase) {
-	c.Dispatcher = dispatcher
 }
 
 func (c *WatcherEventUseCase) ownedWatcher(db *gorm.DB, watcherID, userID string) (*entity.Watcher, error) {
@@ -441,7 +438,7 @@ func (c *WatcherEventUseCase) Test(ctx context.Context, request *model.TestWatch
 		return nil, fiber.ErrInternalServerError
 	}
 
-	deliveries, err := c.Dispatcher.Deliveries.FindByRun(db, reloaded.ID)
+	deliveries, err := c.Deliveries.FindByRun(db, reloaded.ID)
 	if err == nil {
 		reloaded.Deliveries = deliveries
 	}

@@ -36,16 +36,14 @@ func NewActivityUseCase(db *gorm.DB, log *logrus.Logger, validate *validator.Val
 	matches *repository.MatchedEmailRepository, runs *repository.EventRunRepository,
 	deliveries *repository.NotificationDeliveryRepository, events *repository.WatcherEventRepository,
 	watchers *repository.WatcherRepository, accounts *repository.MailAccountRepository,
-	notifiers *repository.NotifierRepository, audit *AuditUseCase) *ActivityUseCase {
+	notifiers *repository.NotifierRepository, dispatcher *DispatcherUseCase,
+	audit *AuditUseCase) *ActivityUseCase {
 	return &ActivityUseCase{
 		DB: db, Log: log, Validate: validate,
 		Matches: matches, Runs: runs, Deliveries: deliveries, Events: events,
-		Watchers: watchers, Accounts: accounts, Notifiers: notifiers, Audit: audit,
+		Watchers: watchers, Accounts: accounts, Notifiers: notifiers,
+		Dispatcher: dispatcher, Audit: audit,
 	}
-}
-
-func (c *ActivityUseCase) SetDispatcher(dispatcher *DispatcherUseCase) {
-	c.Dispatcher = dispatcher
 }
 
 func (c *ActivityUseCase) ListMatches(ctx context.Context, request *model.ListMatchedEmailRequest) ([]model.MatchedEmailResponse, *model.PageMetadata, error) {
