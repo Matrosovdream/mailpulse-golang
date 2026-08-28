@@ -79,11 +79,13 @@ func Bootstrap(config *BootstrapConfig) *Container {
 	authTTL := time.Duration(config.Config.GetInt("redis.ttl.auth")) * time.Second
 	resetTTL := time.Duration(config.Config.GetInt("redis.ttl.password_reset")) * time.Second
 	stateTTL := time.Duration(config.Config.GetInt("redis.ttl.oauth_state")) * time.Second
+	providerTTL := time.Duration(config.Config.GetInt("redis.ttl.mail_provider")) * time.Second
 	userCache := cache.NewUserCache(config.Redis, config.Log, authTTL)
 	resetCache := cache.NewPasswordResetCache(config.Redis, config.Log, resetTTL)
 	oauthStates := cache.NewOAuthStateCache(config.Redis, config.Log, stateTTL)
 	rateLimiter := cache.NewRateLimiter(config.Redis, config.Log)
 	locks := cache.NewLock(config.Redis, config.Log)
+	providerCache := cache.NewMailProviderCache(config.Redis, config.Log, providerTTL)
 
 	// ---------------------------------------------------------------- producers
 	var userProducer *messaging.UserProducer
@@ -170,7 +172,7 @@ func Bootstrap(config *BootstrapConfig) *Container {
 		users, roles, sessions, audit, userProducer, userCache, resetCache, sessionTTL)
 
 	mailResolver := usecase.NewMailResolver(config.DB, mailProviders, accounts, providers,
-		oauthClients, cipher, locks, config.Log)
+		oauthClients, cipher, locks, providerCache, config.Log)
 
 	pipeline := usecase.NewPipelineUseCase(config.DB, config.Log, accounts, watchers,
 		filters, watcherEvents, matches, runs, syncRuns, providers, cipher, mailResolver)

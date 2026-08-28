@@ -63,25 +63,61 @@ type MailResolver struct {
 	Cipher   *secret.Cipher
 	Lock     *cache.Lock
 	Log      *logrus.Logger
+
+	// Providers caches the mail_providers row per slug. Only this path uses
+	// it: the poller resolves every account on every cycle, so the same seven
+	// rows are read thousands of times a minute. The HTTP write paths in
+	// MailAccountUseCase deliberately still read through, so an edited
+	// provider takes effect there immediately.
+	Providers *cache.MailProviderCache
 }
 
 func NewMailResolver(db *gorm.DB, rows *repository.MailProviderRepository,
 	accounts *repository.MailAccountRepository, registry *mail.Registry,
 	oauthClients *oauth.Registry, cipher *secret.Cipher,
-	lock *cache.Lock, log *logrus.Logger) *MailResolver {
+	lock *cache.Lock, providers *cache.MailProviderCache, log *logrus.Logger) *MailResolver {
 	return &MailResolver{
 		DB: db, Rows: rows, Accounts: accounts, Registry: registry,
-		OAuth: oauthClients, Cipher: cipher, Lock: lock, Log: log,
+		OAuth: oauthClients, Cipher: cipher, Lock: lock,
+		Providers: providers, Log: log,
 	}
 }
 
-func (r *MailResolver) Row(db *gorm.DB, slug string) (*entity.MailProvider, error) {
+// Row returns the mail_providers row for a slug, through the cache.
+//
+// A cache that is unreachable, or holds nothing yet, falls through to the
+// database rather than reporting the provider as unknown — the failure mode of
+// getting that backwards is every mailbox in the fleet parked at once.
+func (r *MailResolver) Row(ctx context.Context, db *gorm.DB, slug string) (*entity.MailProvider, error) {
+	if r.Providers != nil {
+		if row, found, cached := r.Providers.Lookup(ctx, slug); cached {
+			if !found {
+				return nil, unknownProvider(slug)
+			}
+			return row, nil
+		}
+	}
+
 	row := new(entity.MailProvider)
 	if err := r.Rows.FindBySlug(db, row, slug); err != nil {
-		return nil, fiber.NewError(fiber.StatusBadRequest,
-			fmt.Sprintf("unknown mail provider %q", slug))
+		if r.Providers != nil {
+			// remember the miss too: an unknown slug is a 400, and a client
+			// retrying one would otherwise reach the database every time
+			r.Providers.Remember(ctx, slug, nil)
+		}
+		return nil, unknownProvider(slug)
 	}
+
+	if r.Providers != nil {
+		r.Providers.Remember(ctx, slug, row)
+	}
+
 	return row, nil
+}
+
+func unknownProvider(slug string) error {
+	return fiber.NewError(fiber.StatusBadRequest,
+		fmt.Sprintf("unknown mail provider %q", slug))
 }
 
 // Resolve prepares an account for use, renewing its access token first when one
@@ -89,7 +125,7 @@ func (r *MailResolver) Row(db *gorm.DB, slug string) (*entity.MailProvider, erro
 // saves it afterwards writes the refreshed credentials rather than the stale
 // ones it read.
 func (r *MailResolver) Resolve(ctx context.Context, db *gorm.DB, account *entity.MailAccount) (mail.Provider, mail.Account, error) {
-	row, err := r.Row(db, account.Provider)
+	row, err := r.Row(ctx, db, account.Provider)
 	if err != nil {
 		return nil, mail.Account{}, err
 	}
