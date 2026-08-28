@@ -148,9 +148,25 @@ func (c *PipelineUseCase) SyncAccount(ctx context.Context, account *entity.MailA
 		return nil, fiber.NewError(fiber.StatusUnprocessableEntity, err.Error())
 	}
 
+	// Filters are loaded once for the whole sync, not once per message per
+	// watcher. Inside the loop this was messages x watchers queries — 600 for
+	// a full 200-message fetch against three watchers — repeated on every poll
+	// of every account, forever. The watchers were already read once above;
+	// their filters change no more often than they do.
+	watcherIDs := make([]string, 0, len(watchers))
+	for i := range watchers {
+		watcherIDs = append(watcherIDs, watchers[i].ID)
+	}
+
+	filtersByWatcher, err := c.Filters.FindByWatchers(db, watcherIDs)
+	if err != nil {
+		finish(entity.SyncStatusError, 0, 0, err)
+		return nil, fiber.ErrInternalServerError
+	}
+
 	matchesCreated := 0
 	for i := range result.Messages {
-		created, err := c.evaluate(ctx, account, watchers, &result.Messages[i])
+		created, err := c.evaluate(ctx, account, watchers, filtersByWatcher, &result.Messages[i])
 		if err != nil {
 			c.Log.WithError(err).Warn("Failed to evaluate a message")
 			continue
@@ -179,8 +195,12 @@ func (c *PipelineUseCase) SyncAccount(ctx context.Context, account *entity.MailA
 }
 
 // evaluate tests one message against every active watcher on the account.
+//
+// filtersByWatcher is passed in rather than read here: this runs once per
+// message, so a query inside it is multiplied by the fetch size.
 func (c *PipelineUseCase) evaluate(ctx context.Context, account *entity.MailAccount,
-	watchers []entity.Watcher, message *mail.Message) (int, error) {
+	watchers []entity.Watcher, filtersByWatcher map[string][]entity.WatcherFilter,
+	message *mail.Message) (int, error) {
 	created := 0
 
 	for i := range watchers {
@@ -198,12 +218,7 @@ func (c *PipelineUseCase) evaluate(ctx context.Context, account *entity.MailAcco
 			}
 		}
 
-		filters, err := c.Filters.FindByWatcher(c.DB.WithContext(ctx), watcher.ID)
-		if err != nil {
-			return created, err
-		}
-
-		outcome := EvaluateFilters(&watcher, filters, message)
+		outcome := EvaluateFilters(&watcher, filtersByWatcher[watcher.ID], message)
 		if !outcome.Matched {
 			continue
 		}

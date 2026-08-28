@@ -1,0 +1,49 @@
+{
+  "suite": "worker",
+  "started_at": "2026-08-28T02:38:36.02138646Z",
+  "elapsed": 678615084,
+  "git_sha": "a295ae1",
+  "params": {
+    "accounts": 60,
+    "batch": 20,
+    "cycles": 3,
+    "error_rate": 0,
+    "interval": "30s",
+    "messages": 50,
+    "p50": "1ms",
+    "p99": "2ms",
+    "timeout": "30s",
+    "timeout_rate": 0,
+    "workers": 1
+  },
+  "metrics": [
+    {
+      "name": "poll-cycle",
+      "stats": {
+        "count": 3,
+        "errors": 0,
+        "min": 200521291,
+        "p50": 200811334,
+        "p95": 237753291,
+        "p99": 237753291,
+        "max": 237753291,
+        "mean": 213028638,
+        "elapsed": 639092208,
+        "per_second": 4.694158311502994
+      },
+      "extra": {
+        "accounts_polled": 60,
+        "queue_depth_end": 60,
+        "stub_failures": 0,
+        "stub_syncs": 60,
+        "stub_timeouts": 0
+      }
+    }
+  ],
+  "findings": [
+    "cycle p50 201ms, p99 238ms, against a 30s interval",
+    "sustains roughly 2987 accounts at a 30s interval (batch 20, 149.4 cycles per interval)",
+    "polled 60 accounts across 3 cycles; 60 still due at the end",
+    "queue depth is non-zero after the run: raise -cycles to see whether it drains or climbs"
+  ]
+}
