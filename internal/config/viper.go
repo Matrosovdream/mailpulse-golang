@@ -137,6 +137,9 @@ func setDefaults(config *viper.Viper) {
 	config.SetDefault("database.password", "postgres")
 	config.SetDefault("database.name", "mailpulse")
 	config.SetDefault("database.sslmode", "disable")
+	// only read when sslmode is verify-ca or verify-full; the path is inside
+	// the container, so a remote database's CA has to be mounted in
+	config.SetDefault("database.sslrootcert", "")
 	config.SetDefault("database.timezone", "UTC")
 	config.SetDefault("database.pool.idle", 10)
 	config.SetDefault("database.pool.max", 100)
@@ -144,13 +147,30 @@ func setDefaults(config *viper.Viper) {
 
 	config.SetDefault("redis.host", "localhost")
 	config.SetDefault("redis.port", 6379)
+	config.SetDefault("redis.username", "")
 	config.SetDefault("redis.password", "")
 	config.SetDefault("redis.db", 0)
 	config.SetDefault("redis.pool.size", 10)
+
+	// for a Redis that is not in this compose file. Defaults keep the
+	// co-located case behaving exactly as before: no TLS, go-redis's own
+	// timeouts, one connection attempt.
+	config.SetDefault("redis.tls", false)
+	config.SetDefault("redis.tls_insecure", false)
+	config.SetDefault("redis.timeout.dial", 0)
+	config.SetDefault("redis.timeout.read", 0)
+	config.SetDefault("redis.timeout.write", 0)
+	config.SetDefault("redis.max_retries", 3)
+	config.SetDefault("redis.connect_attempts", 1)
 	config.SetDefault("redis.ttl.auth", 300)
 	config.SetDefault("redis.ttl.password_reset", 1800)
 	// how long a consent screen may sit open before the callback is refused
 	config.SetDefault("redis.ttl.oauth_state", 600)
+	// mail_providers is seven rows that change when a seeder runs, and it is
+	// read once per account per poll cycle. Long TTL; the HTTP write paths
+	// read through, so an edit is only invisible to the poller and only until
+	// this lapses.
+	config.SetDefault("redis.ttl.mail_provider", 600)
 
 	config.SetDefault("kafka.bootstrap.servers", "localhost:9092")
 	config.SetDefault("kafka.group.id", "mailpulse")

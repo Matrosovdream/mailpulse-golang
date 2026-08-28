@@ -26,6 +26,12 @@ func NewDatabase(viper *viper.Viper, log *logrus.Logger) *gorm.DB {
 	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%d sslmode=%s TimeZone=%s",
 		host, username, password, database, port, sslMode, timeZone)
 
+	// verify-ca and verify-full need a CA to verify against; the other modes
+	// ignore it, so it is only appended when set
+	if rootCert := viper.GetString("database.sslrootcert"); rootCert != "" {
+		dsn += " sslrootcert=" + rootCert
+	}
+
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
 		Logger: logger.New(&logrusWriter{Logger: log}, logger.Config{
 			SlowThreshold:             time.Second * 5,
