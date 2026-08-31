@@ -2,7 +2,7 @@
 
 **Status:** tests done (three layers, all green), the three security bugs fixed,
 and the API spec plus CORS shipped (2026-08-20). Worker is untouched; ops is
-down to healthchecks, the migrate targets and README; CI landed 2026-08-31.
+done as of 2026-08-31: CI, healthchecks, the migrate targets, the README.
 Everything here is known-missing rather than discovered-later, and each item
 has been observed, not assumed.
 
@@ -89,14 +89,31 @@ never needs a database.
 
 ## Ops
 
-- [ ] `make migrate-up` / `migrate-down` / `migrate-version` are all broken:
-      `docker compose run --rm migrate up` replaces the service's whole
-      `command`, dropping `-path` and `-database`, so every target dies with
-      "URL cannot be empty". Migrations only apply because the stack runs the
-      service as a `depends_on` at startup. Fix by putting the flags in an
-      `entrypoint` rather than `command`, so `run` only appends the verb.
-- [ ] No container healthcheck on `web` / `worker` — `/api/health` now exists,
-      so compose can use it.
+- [x] ~~`make migrate-up` / `migrate-down` / `migrate-version` are all
+      broken~~ — fixed 2026-08-31 exactly as diagnosed: `-path` and `-database`
+      moved into `entrypoint` in both compose files, `command` left holding
+      only the default verb `up`, so `run` appends to a complete command line
+      instead of replacing it. Startup is unchanged. `make migrate-create`
+      keeps its explicit `--entrypoint migrate` override, which is now
+      load-bearing rather than incidental — `create` must not inherit the
+      connection flags.
+- [x] ~~No container healthcheck on `web` / `worker`~~ — both carry one in
+      both compose files, 2026-08-31. `web` is probed on `/api/health`, which
+      answers 503 when Postgres or Redis is down, so it is a dependency check
+      and not a liveness ping.
+
+      `worker` needed building first. It serves no API, and the fiber app
+      `Bootstrap` hands it already carries the whole route table — listening on
+      that one would have served the entire API, admin included, from the
+      worker container. So it got its own one-route listener on
+      `WORKER_HEALTH_PORT` (3001, published in dev only), reporting the same
+      dependency check **plus whether each loop is still ticking**: a poller
+      wedged on a mailbox that never replies leaves the process alive and a
+      process check calling it healthy, which is precisely the failure the
+      missing per-item deadline makes real. Budget is three intervals with a
+      sixty-second floor; `cmd/worker/health_test.go` covers the stall
+      arithmetic. That listener is also where `pprof` and `/metrics` should go
+      ([05](05-load-testing.md)).
 - [x] ~~`api/api-spec.json` is empty~~ — landed as `api/openapi.yaml` (YAML, not
       JSON: it is hand-written, and the comments and prose are the point).
       OpenAPI 3.1, all 75 routes, embedded via `go:embed` and served at
@@ -105,7 +122,10 @@ never needs a database.
       `redocly lint` clean, 14/14 live responses validated against their
       schemas with ajv, and `orval` + `openapi-typescript` both generate a
       usable client.
-- [ ] `README.md` is still one line.
+- [x] ~~`README.md` is still one line.~~ — written 2026-08-31: what the
+      product does and the pipeline, quick start, configuration, layout, the
+      three test layers, load and benchmarks, CI, deployment with the five
+      variables compose hard-requires, and an honest list of the known gaps.
 - [x] ~~**No CORS anywhere**~~ — done 2026-08-20. `middleware.NewCORS` mounted
       by `RouteConfig.SetupCORS` **before every other group**, which is the
       whole point: a browser sends its preflight without `Authorization`, so
@@ -122,7 +142,11 @@ never needs a database.
       next to the middleware and 4 feature tests through the real route table
       (the latter skip when `WEB_CORS_ORIGINS` is unset, rather than passing
       vacuously). No new dependency — `cors` ships inside fiber v2.
-- [ ] `.env.prod` must be created before the prod stack starts.
+- [x] ~~`.env.prod` must be created before the prod stack starts.~~ —
+      documented in the README's deployment section, including that
+      `SECURITY_ENCRYPTION_KEY` is *not* among the five compose refuses to
+      start without: it arrives via `env_file`, which compose never
+      interpolates, so a missing key fails at app startup rather than at `up`.
 - [x] ~~No CI pipeline.~~ — `.github/workflows/ci.yml`, three jobs, 2026-08-31.
       `check` runs gofmt, `go vet` under all three tag sets and a `go mod tidy`
       diff — `./...` on its own never sees the tagged test packages, so a

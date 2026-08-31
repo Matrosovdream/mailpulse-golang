@@ -57,6 +57,11 @@ Working end to end, verified against a real IMAP server:
       against Postgres, Redis and GreenMail service containers; and the `prod`
       image published to `ghcr.io/matrosovdream/mailpulse-golang` from `main`
       and `v*` tags. Nothing deploys: there is no host yet
+- [x] Ops closed out — `web` and `worker` both have healthchecks in both
+      compose files; the worker got its own one-route health listener on 3001
+      reporting loop liveness, because a process check calls a wedged poller
+      healthy; the three `make migrate-*` targets work (flags moved to
+      `entrypoint`); and `README.md` is a real README
 
 Verified only against a fake provider, not a real one:
 
@@ -102,7 +107,8 @@ sequence across them.
    renewal loop.
 8. **Worker** — dispatcher tests first, then cron expansion, dead-letter path,
    Telegram `callback_query`.
-9. **Ops** — healthchecks on `web`/`worker`, the migrate targets, README.
+9. ~~**Ops**~~ — done 2026-08-31: CI, healthchecks on `web`/`worker`, the
+   migrate targets, README ([03](03-platform-gaps.md)).
 10. **Inbound relay** — last, nothing needs it yet.
 
 Load and performance work ([05](05-load-testing.md)) is sequenced separately

@@ -263,7 +263,9 @@ create index idx_push_renewal on mail_push_subscriptions (expires_at) where stat
 Short-lived CSRF state for authorize → callback. **No table** — Redis, same
 pattern as `PasswordResetCache`.
 
-- [ ] `OAuthStateCache` in `internal/gateway/cache/`
+- [x] `OAuthStateCache` in `internal/gateway/cache/` — built and wired
+      (`config/app.go`, consumed by `mail_account_usecase`), single-use state
+      covered by `test/integration/oauth_state_test.go`
 
 ---
 

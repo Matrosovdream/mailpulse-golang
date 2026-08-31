@@ -79,10 +79,15 @@ services:
     image: migrate/migrate:v4.18.1
     volumes:
       - ./db/migrations:/migrations:ro
-    command:
+    # The connection flags live in entrypoint rather than command so that
+    # `docker compose run --rm migrate <verb>` keeps them: run replaces the
+    # whole command, which is what left every make migrate-* target dying with
+    # "URL cannot be empty". command carries only the default verb.
+    entrypoint:
+      - "migrate"
       - "-path=/migrations"
       - "-database=postgres://${DATABASE_USERNAME:-postgres}:${DATABASE_PASSWORD:-postgres}@postgres:5432/${DATABASE_NAME:-mailpulse}?sslmode=disable"
-      - "up"
+    command: ["up"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -107,6 +112,15 @@ services:
       - .:/src
       - gomod:/go/pkg/mod
       - gobuild:/root/.cache/go-build
+    healthcheck:
+      # /api/health pings postgres and redis and answers 503 when either is
+      # down, so this probes the dependencies rather than just the listener.
+      # The allowance is generous because air rebuilds on every save.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
     depends_on:
       postgres:
         condition: service_healthy
@@ -129,10 +143,24 @@ services:
       DATABASE_HOST: postgres
       REDIS_HOST: redis
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    ports:
+      # published in dev only, so the loop report can be read from the host.
+      # Production keeps it inside the network. Host side only, like the other
+      # *_HOST_PORT vars: WORKER_HEALTH_PORT is what the binary itself reads.
+      - "${WORKER_HEALTH_HOST_PORT:-3001}:3001"
     volumes:
       - .:/src
       - gomod:/go/pkg/mod
       - gobuild:/root/.cache/go-build
+    healthcheck:
+      # The worker serves no API. This is its own one-route listener, which
+      # reports the same dependency check plus whether each loop is still
+      # ticking — a wedged poller is the failure a process check cannot see.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3001/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
     depends_on:
       postgres:
         condition: service_healthy

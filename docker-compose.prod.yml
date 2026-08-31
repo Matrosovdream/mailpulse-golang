@@ -68,10 +68,14 @@ services:
     image: migrate/migrate:v4.18.1
     volumes:
       - ./db/migrations:/migrations:ro
-    command:
+    # Flags in entrypoint, verb in command: `docker compose run --rm migrate
+    # <verb>` replaces command wholesale, so anything kept there is lost the
+    # moment a migration is run by hand.
+    entrypoint:
+      - "migrate"
       - "-path=/migrations"
       - "-database=postgres://${DATABASE_USERNAME}:${DATABASE_PASSWORD}@postgres:5432/${DATABASE_NAME}?sslmode=${DATABASE_SSLMODE:-disable}"
-      - "up"
+    command: ["up"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -91,6 +95,14 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     ports:
       - "${WEB_PUBLISH_ADDR:-127.0.0.1}:${WEB_PORT:-3000}:3000"
+    healthcheck:
+      # /api/health pings postgres and redis and answers 503 when either is
+      # down, so a proxy in front of this sees a real dependency check
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     depends_on:
       postgres:
         condition: service_healthy
@@ -118,6 +130,15 @@ services:
       DATABASE_HOST: postgres
       REDIS_HOST: redis
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    healthcheck:
+      # The worker's own one-route listener on 3001, deliberately not published
+      # to the host: it reports the dependency check plus whether each loop is
+      # still ticking, which is the failure a process check cannot see.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3001/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     depends_on:
       postgres:
         condition: service_healthy

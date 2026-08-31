@@ -84,7 +84,7 @@ test: test-unit test-integration test-feature ## Run every test layer
 
 .PHONY: test-unit
 test-unit: ## Unit tests only, no infrastructure needed
-	go test ./internal/... $(ARGS)
+	go test ./internal/... ./cmd/... $(ARGS)
 
 .PHONY: test-integration
 test-integration: ## Repository and seeder tests against the dev database

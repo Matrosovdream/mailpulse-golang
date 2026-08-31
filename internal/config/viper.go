@@ -111,6 +111,11 @@ func setDefaults(config *viper.Viper) {
 	config.SetDefault("worker.dispatch_batch", 50)
 	config.SetDefault("worker.verify_interval", 3600)
 	config.SetDefault("worker.verify_batch", 20)
+	// The worker's own health port, serving exactly one route. It is never
+	// published to the host in production — compose probes it from inside the
+	// network. Separate from the web binary's /api/health, which is a
+	// different listener in a different process.
+	config.SetDefault("worker.health_port", 3001)
 
 	config.SetDefault("mail.imap_timeout", 30)
 	// how stale a credential check may get before the worker re-tests it

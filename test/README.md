@@ -5,7 +5,7 @@ layers apart, so `go test ./...` never needs a database.
 
 | Layer | Lives in | Needs | Run with |
 |-------|----------|-------|----------|
-| unit | `internal/**/*_test.go` | nothing | `make test-unit` |
+| unit | `internal/`, `cmd/` | nothing | `make test-unit` |
 | integration | `test/integration/` | postgres, redis | `make test-integration` |
 | feature | `test/feature/` | postgres, redis, mail server, the whole app | `make test-feature` |
 
@@ -20,7 +20,9 @@ which is the Go convention and keeps them impossible to miss.
 
 Covers the filter matcher (every field and operator, match modes, case
 sensitivity, invalid regex), the AES-GCM cipher (round trip, tampering, wrong
-key), and the small pieces of logic on entities and models.
+key), the worker's loop-stall detection (`cmd/worker`, the one place a unit test
+sits outside `internal/`), and the small pieces of logic on entities and
+models.
 
 ## integration
 

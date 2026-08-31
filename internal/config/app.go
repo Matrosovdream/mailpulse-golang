@@ -45,6 +45,13 @@ type Container struct {
 	Dispatcher   *usecase.DispatcherUseCase
 	MailAccounts *usecase.MailAccountUseCase
 
+	// Catalog is exposed for its Health check and nothing else. cmd/worker
+	// cannot serve the route table it was given — Bootstrap registers all 75
+	// routes on whatever fiber app it is handed, so listening on that one
+	// would serve the whole API, admin included, from the worker container.
+	// Its health port mounts this directly instead.
+	Catalog *usecase.CatalogUseCase
+
 	// Providers is exposed so a tool can substitute the mail client after
 	// wiring — cmd/loadtest swaps in the load stub, because measuring the
 	// pipeline against a real mailbox measures the mailbox. Nothing in the
@@ -73,6 +80,7 @@ func Bootstrap(config *BootstrapConfig) *Container {
 		Pipeline:     useCases.Pipeline,
 		Dispatcher:   useCases.Dispatcher,
 		MailAccounts: useCases.MailAccount,
+		Catalog:      useCases.Catalog,
 		Providers:    registries.Providers,
 	}
 }

@@ -40,10 +40,16 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	go runPoller(ctx, logger, viperConfig, container)
-	go runDispatcher(ctx, logger, viperConfig, container)
-	go runCredentialChecker(ctx, logger, viperConfig, container)
+	// The three ticking loops report their liveness here; the user consumer
+	// does not, because it is off unless Kafka is enabled and a worker running
+	// without it is healthy, not stalled.
+	loops := newLoopHealth()
+
+	go runPoller(ctx, logger, viperConfig, container, loops)
+	go runDispatcher(ctx, logger, viperConfig, container, loops)
+	go runCredentialChecker(ctx, logger, viperConfig, container, loops)
 	go runUserConsumer(ctx, logger, viperConfig)
+	go serveHealth(ctx, logger, viperConfig, container, loops)
 
 	terminate := make(chan os.Signal, 1)
 	signal.Notify(terminate, syscall.SIGINT, syscall.SIGTERM)
@@ -57,9 +63,13 @@ func main() {
 
 // runPoller drives the mail side: claim the mailboxes whose poll is due, fetch,
 // match, and schedule the resulting events.
-func runPoller(ctx context.Context, log *logrus.Logger, viperConfig *viper.Viper, container *config.Container) {
+func runPoller(ctx context.Context, log *logrus.Logger, viperConfig *viper.Viper,
+	container *config.Container, loops *loopHealth) {
+
 	interval := time.Duration(viperConfig.GetInt("worker.poll_interval")) * time.Second
 	batch := viperConfig.GetInt("worker.poll_batch")
+
+	loops.register("poller", interval)
 
 	log.Infof("Mail poller running every %s", interval)
 
@@ -73,6 +83,7 @@ func runPoller(ctx context.Context, log *logrus.Logger, viperConfig *viper.Viper
 			return
 		case <-ticker.C:
 			polled, err := container.Pipeline.PollDue(ctx, batch)
+			loops.tick("poller")
 			if err != nil {
 				log.WithError(err).Warn("Mail poll failed")
 				continue
@@ -86,9 +97,13 @@ func runPoller(ctx context.Context, log *logrus.Logger, viperConfig *viper.Viper
 
 // runDispatcher drains event_runs. Several workers can run this concurrently:
 // the claim uses SKIP LOCKED, so they share the queue instead of colliding.
-func runDispatcher(ctx context.Context, log *logrus.Logger, viperConfig *viper.Viper, container *config.Container) {
+func runDispatcher(ctx context.Context, log *logrus.Logger, viperConfig *viper.Viper,
+	container *config.Container, loops *loopHealth) {
+
 	interval := time.Duration(viperConfig.GetInt("worker.dispatch_interval")) * time.Second
 	batch := viperConfig.GetInt("worker.dispatch_batch")
+
+	loops.register("dispatcher", interval)
 
 	log.Infof("Event dispatcher running every %s", interval)
 
@@ -102,6 +117,7 @@ func runDispatcher(ctx context.Context, log *logrus.Logger, viperConfig *viper.V
 			return
 		case <-ticker.C:
 			handled, err := container.Dispatcher.Tick(ctx, batch)
+			loops.tick("dispatcher")
 			if err != nil {
 				log.WithError(err).Warn("Dispatch tick failed")
 				continue
@@ -118,10 +134,14 @@ func runDispatcher(ctx context.Context, log *logrus.Logger, viperConfig *viper.V
 // App passwords get revoked and hosts change, and without this the first sign
 // would be a watcher that quietly stopped firing. A failure marks the account
 // error, which also removes it from the poll queue until it recovers.
-func runCredentialChecker(ctx context.Context, log *logrus.Logger, viperConfig *viper.Viper, container *config.Container) {
+func runCredentialChecker(ctx context.Context, log *logrus.Logger, viperConfig *viper.Viper,
+	container *config.Container, loops *loopHealth) {
+
 	interval := time.Duration(viperConfig.GetInt("worker.verify_interval")) * time.Second
 	olderThan := time.Duration(viperConfig.GetInt("mail.reverify_after")) * time.Second
 	batch := viperConfig.GetInt("worker.verify_batch")
+
+	loops.register("credentials", interval)
 
 	log.Infof("Credential checker running every %s, re-checking anything older than %s", interval, olderThan)
 
@@ -135,6 +155,7 @@ func runCredentialChecker(ctx context.Context, log *logrus.Logger, viperConfig *
 			return
 		case <-ticker.C:
 			checked, failed, err := container.MailAccounts.ReverifyDue(ctx, olderThan, batch)
+			loops.tick("credentials")
 			if err != nil {
 				log.WithError(err).Warn("Credential check failed")
 				continue
