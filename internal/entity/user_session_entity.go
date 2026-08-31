@@ -12,8 +12,8 @@ type UserSession struct {
 	ExpiresAt      int64   `gorm:"column:expires_at"`
 	RevokedAt      *int64  `gorm:"column:revoked_at"`
 	LastUsedAt     int64   `gorm:"column:last_used_at"`
-	CreatedAt  int64   `gorm:"column:created_at;autoCreateTime:milli"`
-	UpdatedAt  int64   `gorm:"column:updated_at;autoCreateTime:milli;autoUpdateTime:milli"`
+	CreatedAt      int64   `gorm:"column:created_at;autoCreateTime:milli"`
+	UpdatedAt      int64   `gorm:"column:updated_at;autoCreateTime:milli;autoUpdateTime:milli"`
 }
 
 func (s *UserSession) TableName() string {

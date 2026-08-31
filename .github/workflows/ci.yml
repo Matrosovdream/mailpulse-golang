@@ -1,0 +1,228 @@
+name: CI
+
+# One workflow rather than a separate release file, so the image job can sit
+# behind `needs: [check, test]`. Split across two files, a push to main starts
+# both at once and an image can publish from a commit whose tests went red.
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+    tags: ["v*"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ---------------------------------------------------------------- check
+  check:
+    name: Format, vet, tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # single source of truth for the version; go.mod says 1.25.0
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"
+            echo "$unformatted"
+            gofmt -d $unformatted
+            exit 1
+          fi
+
+      - name: go vet
+        # ./... alone never sees the tagged test packages: their build
+        # constraints exclude every file, so a broken test/ compiles green
+        run: |
+          go vet ./...
+          go vet -tags=integration ./test/...
+          go vet -tags=feature ./test/...
+
+      - name: go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  # ---------------------------------------------------------------- test
+  test:
+    name: Tests (unit, integration, feature)
+    runs-on: ubuntu-latest
+
+    # The same images and versions the dev stack pins in
+    # docker-compose.dev.yml, so a green run here means the same thing it
+    # means locally. Kafka is deliberately absent: the harness wires
+    # Producer: nil and nothing on the request path touches it.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mailpulse
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d mailpulse"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+
+      # a real IMAP + SMTP server, so the pipeline test delivers and syncs
+      # actual mail. auth.disabled is deliberately not set, exactly as in the
+      # dev stack: it makes GreenMail auto-create users on login, which then
+      # collides with the two declared here.
+      greenmail:
+        image: greenmail/standalone:2.1.0
+        env:
+          GREENMAIL_OPTS: -Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=demo:secret123@corp.com,ops:secret123@corp.com
+        ports:
+          - 3143:3143
+          - 3025:3025
+
+    env:
+      # service containers are reached on the runner's loopback, not by the
+      # compose service names the defaults in internal/config/viper.go use
+      DATABASE_HOST: localhost
+      DATABASE_PORT: "5432"
+      DATABASE_USERNAME: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_NAME: mailpulse
+      DATABASE_SSLMODE: disable
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      TEST_MAIL_HOST: localhost
+      TEST_MAIL_PORT: "3143"
+      TEST_SMTP_PORT: "3025"
+      KAFKA_PRODUCER_ENABLED: "false"
+      # 4 = warn. The app logs at debug in development, which would bury the
+      # failures in the run log.
+      LOG_LEVEL: "4"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate an encryption key for this run
+        # The app refuses to start without one, on purpose. Generated rather
+        # than committed: nothing survives the job, so a key-shaped string in
+        # the repo would buy nothing but the habit of committing keys.
+        run: echo "SECURITY_ENCRYPTION_KEY=$(openssl rand -base64 32)" >> "$GITHUB_ENV"
+
+      - name: Wait for GreenMail
+        # The image ships no health command, so the service is "started" long
+        # before the JVM is listening.
+        shell: bash
+        run: |
+          for _ in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/localhost/3143) 2>/dev/null; then
+              echo "greenmail is accepting connections on 3143"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "greenmail never came up on 3143"
+          exit 1
+
+      - name: Apply migrations
+        # The same pinned image compose uses. This is also what creates the
+        # roles and mail_providers reference rows the feature suite reads —
+        # they are inserted by the migrations, so cmd/seeder never runs here.
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/db/migrations:/migrations:ro" \
+            migrate/migrate:v4.18.1 \
+            -path=/migrations \
+            -database "postgres://postgres:postgres@localhost:5432/mailpulse?sslmode=disable" \
+            up
+
+      # Three steps rather than one, so a failure names its layer.
+      - name: Unit tests
+        run: go test ./internal/...
+
+      - name: Integration tests
+        run: go test -tags=integration -count=1 ./test/integration/...
+
+      - name: Feature tests
+        run: go test -tags=feature -count=1 ./test/feature/...
+
+  # ---------------------------------------------------------------- image
+  image:
+    name: Image
+    runs-on: ubuntu-latest
+    needs: [check, test]
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      # Built on every event so a pull request proves the Dockerfile still
+      # builds; pushed only from main and from a v* tag.
+      PUBLISH: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # one image, not two: the prod stage carries both /app/web and
+          # /app/worker, and compose only varies the entrypoint between them.
+          # The action lower-cases the name, which ghcr.io requires.
+          images: ghcr.io/${{ github.repository }}
+          # latest=auto tags the newest v* release and nothing else
+          flavor: latest=auto
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,format=short,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: prod
+          platforms: linux/amd64
+          push: ${{ env.PUBLISH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
