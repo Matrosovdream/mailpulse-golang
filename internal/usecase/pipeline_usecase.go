@@ -15,6 +15,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 )
 
@@ -37,6 +38,12 @@ type PipelineUseCase struct {
 	Provider *mail.Registry
 	Cipher   *secret.Cipher
 	Resolver *MailResolver
+
+	// Tuning bounds how a claimed batch of mailboxes is worked through. Its
+	// zero value is the serial behaviour it replaced, which is what the HTTP
+	// _sync path still gets: that one syncs a single account and has the
+	// request's own deadline already.
+	Tuning WorkerTuning
 }
 
 func NewPipelineUseCase(db *gorm.DB, log *logrus.Logger,
@@ -44,11 +51,11 @@ func NewPipelineUseCase(db *gorm.DB, log *logrus.Logger,
 	filters *repository.WatcherFilterRepository, events *repository.WatcherEventRepository,
 	matches *repository.MatchedEmailRepository, runs *repository.EventRunRepository,
 	syncRuns *repository.MailSyncRunRepository, provider *mail.Registry,
-	cipher *secret.Cipher, resolver *MailResolver) *PipelineUseCase {
+	cipher *secret.Cipher, resolver *MailResolver, tuning WorkerTuning) *PipelineUseCase {
 	return &PipelineUseCase{
 		DB: db, Log: log, Accounts: accounts, Watchers: watchers, Filters: filters,
 		Events: events, Matches: matches, Runs: runs, SyncRuns: syncRuns,
-		Provider: provider, Cipher: cipher, Resolver: resolver,
+		Provider: provider, Cipher: cipher, Resolver: resolver, Tuning: tuning,
 	}
 }
 
@@ -80,18 +87,60 @@ func (c *PipelineUseCase) PollDue(ctx context.Context, limit int) (int, error) {
 		return 0, err
 	}
 
-	for i := range accounts {
-		if _, err := c.SyncAccount(ctx, &accounts[i]); err != nil {
-			c.Log.WithError(err).Warnf("Sync failed for mail account %s", accounts[i].ID)
-		}
-	}
+	c.syncBatch(ctx, accounts)
 
 	return len(accounts), nil
 }
 
+// syncBatch fetches the claimed mailboxes through a bounded pool.
+//
+// The accounts are safe to work in parallel because the claim above already
+// pushed each one's next_poll_at forward, so no two slots here — in this
+// process or any other — hold the same mailbox. What they do share is the
+// database pool, which is why the fan-out is bounded rather than one goroutine
+// per claimed row.
+func (c *PipelineUseCase) syncBatch(ctx context.Context, accounts []entity.MailAccount) {
+	if len(accounts) == 0 {
+		return
+	}
+
+	group := new(errgroup.Group)
+	group.SetLimit(c.Tuning.limit())
+
+	for i := range accounts {
+		account := &accounts[i]
+
+		group.Go(func() error {
+			// A failed sync is already recorded on the account and its sync run
+			// by SyncAccount, and one mailbox failing says nothing about the
+			// rest of the batch, so the error is logged and not propagated —
+			// returning it would cancel the pool and abandon the other claims.
+			syncCtx, cancel := c.Tuning.item(ctx)
+			defer cancel()
+
+			if _, err := c.SyncAccount(syncCtx, account); err != nil {
+				c.Log.WithError(err).Warnf("Sync failed for mail account %s", account.ID)
+			}
+			return nil
+		})
+	}
+
+	_ = group.Wait()
+}
+
 // SyncAccount fetches one mailbox and runs everything downstream of it.
 func (c *PipelineUseCase) SyncAccount(ctx context.Context, account *entity.MailAccount) (*model.SyncMailAccountResponse, error) {
-	db := c.DB.WithContext(ctx)
+	// The work gets the caller's deadline; the bookkeeping deliberately does
+	// not. finish() has to close the sync run on every path including the one
+	// where the fetch ran out of time, and a close written through an expired
+	// context fails silently — leaving a row in 'running' that makes the
+	// account look like it is still syncing, forever.
+	//
+	// Only the two calls that talk to a remote host below keep ctx. Everything
+	// downstream of the fetch is local work against messages already in hand,
+	// bounded by the fetch limit, and every step of it writes.
+	persist := context.WithoutCancel(ctx)
+	db := c.DB.WithContext(persist)
 
 	syncRun := &entity.MailSyncRun{
 		ID:            uuid.NewString(),
@@ -166,7 +215,7 @@ func (c *PipelineUseCase) SyncAccount(ctx context.Context, account *entity.MailA
 
 	matchesCreated := 0
 	for i := range result.Messages {
-		created, err := c.evaluate(ctx, account, watchers, filtersByWatcher, &result.Messages[i])
+		created, err := c.evaluate(persist, account, watchers, filtersByWatcher, &result.Messages[i])
 		if err != nil {
 			c.Log.WithError(err).Warn("Failed to evaluate a message")
 			continue

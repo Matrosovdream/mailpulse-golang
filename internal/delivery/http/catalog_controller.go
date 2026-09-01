@@ -1,6 +1,9 @@
 package http
 
 import (
+	"strconv"
+	"time"
+
 	"mailpulse/internal/model"
 	"mailpulse/internal/usecase"
 
@@ -13,10 +16,34 @@ import (
 type CatalogController struct {
 	Log     *logrus.Logger
 	UseCase *usecase.CatalogUseCase
+
+	// StaticMaxAge is how long a caller may hold the three registry-backed
+	// catalogs. They are compiled-in tables that only change on deploy, and the
+	// SPA asks for all three while rendering its forms, so this removes
+	// requests at the edge rather than saving work on the server — the
+	// handlers themselves already cost nothing. Zero sends no header at all.
+	StaticMaxAge time.Duration
 }
 
-func NewCatalogController(useCase *usecase.CatalogUseCase, log *logrus.Logger) *CatalogController {
-	return &CatalogController{Log: log, UseCase: useCase}
+func NewCatalogController(useCase *usecase.CatalogUseCase, log *logrus.Logger,
+	staticMaxAge time.Duration) *CatalogController {
+	return &CatalogController{Log: log, UseCase: useCase, StaticMaxAge: staticMaxAge}
+}
+
+// cacheStatic marks a response as holdable for StaticMaxAge.
+//
+// private, not public. These three routes sit behind the auth middleware, and a
+// shared cache that keyed a response served against one bearer token would hand
+// it to the next caller. Nothing user-specific is in these payloads today, and
+// this header should not be the only thing standing between that and a leak if
+// one is ever added.
+func (c *CatalogController) cacheStatic(ctx *fiber.Ctx) {
+	if c.StaticMaxAge <= 0 {
+		return
+	}
+
+	ctx.Set(fiber.HeaderCacheControl,
+		"private, max-age="+strconv.Itoa(int(c.StaticMaxAge.Seconds())))
 }
 
 // MailProviderTypes drives the connect form: which mailboxes a user may add,
@@ -31,14 +58,20 @@ func (c *CatalogController) MailProviderTypes(ctx *fiber.Ctx) error {
 }
 
 func (c *CatalogController) EventTypes(ctx *fiber.Ctx) error {
+	c.cacheStatic(ctx)
+
 	return ctx.JSON(model.WebResponse[[]model.EventTypeResponse]{Data: c.UseCase.EventTypes()})
 }
 
 func (c *CatalogController) NotifierTypes(ctx *fiber.Ctx) error {
+	c.cacheStatic(ctx)
+
 	return ctx.JSON(model.WebResponse[[]model.NotifierTypeResponse]{Data: c.UseCase.NotifierTypes()})
 }
 
 func (c *CatalogController) FilterFields(ctx *fiber.Ctx) error {
+	c.cacheStatic(ctx)
+
 	return ctx.JSON(model.WebResponse[[]model.FilterFieldResponse]{Data: c.UseCase.FilterFields()})
 }
 

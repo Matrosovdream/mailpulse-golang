@@ -43,7 +43,19 @@ func (c *Cache[T]) Get(ctx context.Context, id string) (*T, error) {
 	return entry, nil
 }
 
+// Set stores the value, or does nothing when this cache is switched off.
+//
+// A zero TTL means "off", never "forever". Redis reads a zero expiration as no
+// expiration at all, so without this guard the way an operator would naturally
+// disable a cache — setting its TTL to 0 — would instead start writing keys
+// that never expire. For the auth cache that is not a performance mistake but
+// a security one: a revoked session would keep resolving until someone flushed
+// redis by hand.
 func (c *Cache[T]) Set(ctx context.Context, id string, entry *T) error {
+	if c.TTL <= 0 {
+		return nil
+	}
+
 	value, err := json.Marshal(entry)
 	if err != nil {
 		c.Log.WithError(err).Warnf("failed to marshal cache %s", c.Key(id))
