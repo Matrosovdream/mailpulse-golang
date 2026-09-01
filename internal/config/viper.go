@@ -62,6 +62,13 @@ func setDefaults(config *viper.Viper) {
 	// turn it off where naming every endpoint to an anonymous caller is not
 	// wanted, and the two routes are not registered at all.
 	config.SetDefault("web.docs_enabled", true)
+	// max-age sent on the three registry-backed catalog routes, which are
+	// compiled-in tables that only change on deploy. The SPA asks for all three
+	// while rendering its forms, so this is request count removed at the edge,
+	// not server work saved. 0 sends no header, which is the original behaviour;
+	// the cost of a non-zero value is that a deploy adding an event type stays
+	// invisible to an open tab for that long.
+	config.SetDefault("web.catalog_max_age", 0)
 
 	// there is deliberately no default encryption key: a shipped one reads as
 	// protection while providing none, so an unset key stops the app instead
@@ -80,6 +87,15 @@ func setDefaults(config *viper.Viper) {
 	config.SetDefault("security.ratelimit.forgot_password.window", 900) // 15 minutes
 
 	config.SetDefault("session.ttl", 604800) // 7 days
+	// How stale user_sessions.last_used_at may get before Verify rewrites it.
+	//
+	// The column feeds the session list and nothing else, but it is written on
+	// every auth cache miss — one per session per redis.ttl.auth — so it is a
+	// steady stream of updates to the hottest row in the schema for a timestamp
+	// nobody reads that closely. 0 writes every time, which is the original
+	// behaviour; 300 keeps the column to the minute and takes the write off the
+	// hot path.
+	config.SetDefault("session.touch_interval", 0)
 
 	// OAuth client credentials, one pair per mail_providers slug. There is
 	// deliberately no default: a provider whose id and secret are unset is
@@ -111,6 +127,35 @@ func setDefaults(config *viper.Viper) {
 	config.SetDefault("worker.dispatch_batch", 50)
 	config.SetDefault("worker.verify_interval", 3600)
 	config.SetDefault("worker.verify_batch", 20)
+
+	// How many items of a claimed batch one worker has in flight at once.
+	//
+	// These are the two numbers that actually set worker throughput. Both loops
+	// spend nearly all of their time waiting on a remote host, so a batch worked
+	// serially takes items x latency and throughput settles at one over the
+	// per-item latency — a figure neither the batch size nor the interval above
+	// can move. Raising these is what moves it.
+	//
+	// They ship at 1, which is exactly the serial behaviour that preceded them,
+	// so nothing changes until they are raised deliberately. Raise the matching
+	// batch above with them: a batch is now consumed in parallel, so the old
+	// sizes leave the pool idle for most of each tick.
+	//
+	// Upper bound is database.pool.max, not the remote host: every item in
+	// flight holds a connection, and both loops draw from the same pool.
+	config.SetDefault("worker.dispatch_concurrency", 1)
+	config.SetDefault("worker.poll_concurrency", 1)
+
+	// How long one item of a batch may take before it is abandoned. 0 is
+	// unbounded, which is what these replace.
+	//
+	// Generous on purpose: these are not latency targets but a bound on the
+	// pathological case, where a host accepts the connection and then never
+	// answers. Serially that stalls the loop outright and the health probe
+	// reports the silence; with a pool it quietly holds one slot and the worker
+	// reports itself healthy at reduced capacity, which is the worse failure.
+	config.SetDefault("worker.dispatch_timeout", 60)
+	config.SetDefault("worker.poll_timeout", 300)
 	// The worker's own health port, serving exactly one route. It is never
 	// published to the host in production — compose probes it from inside the
 	// network. Separate from the web binary's /api/health, which is a
@@ -155,7 +200,13 @@ func setDefaults(config *viper.Viper) {
 	config.SetDefault("redis.username", "")
 	config.SetDefault("redis.password", "")
 	config.SetDefault("redis.db", 0)
-	config.SetDefault("redis.pool.size", 10)
+	// A ceiling, not a reservation: go-redis dials lazily, so raising this
+	// costs nothing until the connections are actually wanted. What it buys is
+	// tail latency — every authenticated request does at least one GET here,
+	// and when a hiccup pushes concurrent demand past the ceiling go-redis
+	// blocks callers on pool acquisition, turning a brief slow patch into a
+	// queue.
+	config.SetDefault("redis.pool.size", 100)
 
 	// for a Redis that is not in this compose file. Defaults keep the
 	// co-located case behaving exactly as before: no TLS, go-redis's own
@@ -176,6 +227,12 @@ func setDefaults(config *viper.Viper) {
 	// read through, so an edit is only invisible to the poller and only until
 	// this lapses.
 	config.SetDefault("redis.ttl.mail_provider", 600)
+	// The dashboard rollup is six queries behind the SPA's landing view. There
+	// is no invalidation and none is wanted: the writers that would evict are
+	// in the worker process, and no reader can tell a thirty second old count
+	// from a live one. 0 disables the cache entirely rather than caching
+	// forever — see cache.Cache.Set.
+	config.SetDefault("redis.ttl.dashboard", 0)
 
 	config.SetDefault("kafka.bootstrap.servers", "localhost:9092")
 	config.SetDefault("kafka.group.id", "mailpulse")

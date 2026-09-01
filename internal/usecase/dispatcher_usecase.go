@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 )
 
@@ -25,15 +26,22 @@ type DispatcherUseCase struct {
 	Watchers   *repository.WatcherRepository
 	Events     *repository.WatcherEventRepository
 	Handlers   *event.Registry
+
+	// Tuning bounds how a claimed batch is worked through. Its zero value is
+	// the serial behaviour this field replaced, so the direct callers below
+	// that construct no tuning of their own still behave exactly as before.
+	Tuning WorkerTuning
 }
 
 func NewDispatcherUseCase(db *gorm.DB, log *logrus.Logger,
 	runs *repository.EventRunRepository, deliveries *repository.NotificationDeliveryRepository,
 	matches *repository.MatchedEmailRepository, watchers *repository.WatcherRepository,
-	events *repository.WatcherEventRepository, handlers *event.Registry) *DispatcherUseCase {
+	events *repository.WatcherEventRepository, handlers *event.Registry,
+	tuning WorkerTuning) *DispatcherUseCase {
 	return &DispatcherUseCase{
 		DB: db, Log: log, Runs: runs, Deliveries: deliveries,
 		Matches: matches, Watchers: watchers, Events: events, Handlers: handlers,
+		Tuning: tuning,
 	}
 }
 
@@ -69,11 +77,37 @@ func (c *DispatcherUseCase) Tick(ctx context.Context, limit int) (int, error) {
 		return 0, err
 	}
 
-	for i := range claimed {
-		c.execute(ctx, &claimed[i])
-	}
+	c.runBatch(ctx, claimed)
 
 	return len(claimed), nil
+}
+
+// runBatch works the claimed runs through a bounded pool.
+//
+// Nothing is collected from the pool because there is nothing to collect:
+// execute() records every outcome on the run row itself, including its
+// failures, so Wait here is a join and not an error check.
+func (c *DispatcherUseCase) runBatch(ctx context.Context, claimed []entity.EventRun) {
+	if len(claimed) == 0 {
+		return
+	}
+
+	group := new(errgroup.Group)
+	group.SetLimit(c.Tuning.limit())
+
+	for i := range claimed {
+		run := &claimed[i]
+
+		group.Go(func() error {
+			runCtx, cancel := c.Tuning.item(ctx)
+			defer cancel()
+
+			c.execute(runCtx, run)
+			return nil
+		})
+	}
+
+	_ = group.Wait()
 }
 
 // Execute runs a single run immediately, which is what _retry and the event
@@ -83,7 +117,16 @@ func (c *DispatcherUseCase) Execute(ctx context.Context, run *entity.EventRun) {
 }
 
 func (c *DispatcherUseCase) execute(ctx context.Context, run *entity.EventRun) {
-	db := c.DB.WithContext(ctx)
+	// Bookkeeping deliberately outlives the work.
+	//
+	// Every exit path below writes the run's outcome, and once a per-item
+	// deadline is in play the context that bounded the handler is already done
+	// by the time the interesting paths are reached. Writing through that same
+	// context would fail, leaving the row in 'running' — a status the claim
+	// query never selects, because ClaimDue only takes 'pending'. The run would
+	// be stranded rather than retried, which is a worse failure than the
+	// timeout it came from.
+	db := c.DB.WithContext(context.WithoutCancel(ctx))
 
 	// counted here so both paths agree: the queue tick and the direct calls
 	// from _retry and the event test endpoint

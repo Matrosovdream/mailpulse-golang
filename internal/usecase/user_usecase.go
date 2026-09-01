@@ -35,19 +35,37 @@ type UserUseCase struct {
 	UserCache  *cache.UserCache
 	ResetCache *cache.PasswordResetCache
 	SessionTTL time.Duration
+
+	// TouchInterval is how stale user_sessions.last_used_at may get before
+	// Verify writes it again. Zero writes on every cache miss, which is the
+	// behaviour it replaced.
+	TouchInterval time.Duration
 }
 
 func NewUserUseCase(db *gorm.DB, log *logrus.Logger, validate *validator.Validate,
 	users *repository.UserRepository, roles *repository.RoleRepository,
 	sessions *repository.UserSessionRepository, audit *AuditUseCase,
 	producer *messaging.UserProducer, userCache *cache.UserCache,
-	resetCache *cache.PasswordResetCache, sessionTTL time.Duration) *UserUseCase {
+	resetCache *cache.PasswordResetCache, sessionTTL time.Duration,
+	touchInterval time.Duration) *UserUseCase {
 	return &UserUseCase{
 		DB: db, Log: log, Validate: validate,
 		Users: users, Roles: roles, Sessions: sessions, Audit: audit,
 		Producer: producer, UserCache: userCache, ResetCache: resetCache,
-		SessionTTL: sessionTTL,
+		SessionTTL: sessionTTL, TouchInterval: touchInterval,
 	}
+}
+
+// shouldTouch reports whether last_used_at is stale enough to rewrite.
+//
+// The session row is already loaded by the caller, so this costs a comparison
+// rather than a read.
+func (c *UserUseCase) shouldTouch(session *entity.UserSession, now int64) bool {
+	if c.TouchInterval <= 0 {
+		return true
+	}
+
+	return now-session.LastUsedAt >= c.TouchInterval.Milliseconds()
 }
 
 // hashToken keeps the bearer token out of the database: a dump gives an
@@ -102,9 +120,18 @@ func (c *UserUseCase) Verify(ctx context.Context, request *model.VerifyUserReque
 		return nil, fiber.ErrInternalServerError
 	}
 
-	// written outside the read path's critical section; a stale last_used_at
-	// is not worth a write on every single request
-	_ = c.Sessions.TouchLastUsed(tx, session.ID, now)
+	// last_used_at feeds the session list and nothing else, so writing it on
+	// every cache miss is a write the product does not need. The misses are not
+	// rare either: each active session produces one every time the auth cache
+	// entry lapses, so at scale this is a steady stream of updates to the row
+	// every request of that session already reads, purely to move a timestamp
+	// no reader is watching that closely.
+	//
+	// Skipping the write while the stored value is recent enough keeps the
+	// column useful and takes it off the hot path. Zero writes every time.
+	if c.shouldTouch(session, now) {
+		_ = c.Sessions.TouchLastUsed(tx, session.ID, now)
+	}
 
 	if err := tx.Commit().Error; err != nil {
 		c.Log.Warnf("Failed commit transaction : %+v", err)

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"mailpulse/internal/entity"
+	"mailpulse/internal/gateway/cache"
 	"mailpulse/internal/model"
 	"mailpulse/internal/model/converter"
 	"mailpulse/internal/repository"
@@ -30,6 +31,13 @@ type ActivityUseCase struct {
 	Notifiers  *repository.NotifierRepository
 	Dispatcher *DispatcherUseCase
 	Audit      *AuditUseCase
+
+	// DashboardCache backs the only cached read in this usecase. The lists
+	// below are paged, filtered and sorted by the caller, so their key space is
+	// the query string rather than the user — many keys, each read once. The
+	// rollup takes no parameters beyond the user, which is what makes it worth
+	// caching.
+	DashboardCache *cache.DashboardCache
 }
 
 func NewActivityUseCase(db *gorm.DB, log *logrus.Logger, validate *validator.Validate,
@@ -37,12 +45,12 @@ func NewActivityUseCase(db *gorm.DB, log *logrus.Logger, validate *validator.Val
 	deliveries *repository.NotificationDeliveryRepository, events *repository.WatcherEventRepository,
 	watchers *repository.WatcherRepository, accounts *repository.MailAccountRepository,
 	notifiers *repository.NotifierRepository, dispatcher *DispatcherUseCase,
-	audit *AuditUseCase) *ActivityUseCase {
+	audit *AuditUseCase, dashboard *cache.DashboardCache) *ActivityUseCase {
 	return &ActivityUseCase{
 		DB: db, Log: log, Validate: validate,
 		Matches: matches, Runs: runs, Deliveries: deliveries, Events: events,
 		Watchers: watchers, Accounts: accounts, Notifiers: notifiers,
-		Dispatcher: dispatcher, Audit: audit,
+		Dispatcher: dispatcher, Audit: audit, DashboardCache: dashboard,
 	}
 }
 
@@ -290,6 +298,13 @@ func (c *ActivityUseCase) Dashboard(ctx context.Context, request *model.Dashboar
 		return nil, fiber.ErrBadRequest
 	}
 
+	// A hit here replaces six queries. Read through on any cache error rather
+	// than failing the request: the rollup is derivable from the database at
+	// any time, so redis being unreachable should cost latency, not the page.
+	if cached, err := c.DashboardCache.Get(ctx, request.UserID); err == nil && cached != nil {
+		return cached, nil
+	}
+
 	db := c.DB.WithContext(ctx)
 	since := time.Now().Add(-24 * time.Hour).UnixMilli()
 
@@ -339,6 +354,13 @@ func (c *ActivityUseCase) Dashboard(ctx context.Context, request *model.Dashboar
 				At:          recent[i].MatchedAt,
 			})
 		}
+	}
+
+	// Set is a no-op while redis.ttl.dashboard is 0, which is how this cache
+	// ships: the read above then always misses and the endpoint behaves exactly
+	// as it did before.
+	if err := c.DashboardCache.Set(ctx, request.UserID, response); err != nil {
+		c.Log.WithError(err).Warn("Failed to cache the dashboard summary")
 	}
 
 	return response, nil

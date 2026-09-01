@@ -132,6 +132,7 @@ type caches struct {
 	PasswordReset *cache.PasswordResetCache
 	OAuthStates   *cache.OAuthStateCache
 	MailProviders *cache.MailProviderCache
+	Dashboard     *cache.DashboardCache
 	RateLimiter   *cache.RateLimiter
 	Locks         *cache.Lock
 }
@@ -146,6 +147,7 @@ func newCaches(config *BootstrapConfig) caches {
 		PasswordReset: cache.NewPasswordResetCache(config.Redis, config.Log, seconds("redis.ttl.password_reset")),
 		OAuthStates:   cache.NewOAuthStateCache(config.Redis, config.Log, seconds("redis.ttl.oauth_state")),
 		MailProviders: cache.NewMailProviderCache(config.Redis, config.Log, seconds("redis.ttl.mail_provider")),
+		Dashboard:     cache.NewDashboardCache(config.Redis, config.Log, seconds("redis.ttl.dashboard")),
 		RateLimiter:   cache.NewRateLimiter(config.Redis, config.Log),
 		Locks:         cache.NewLock(config.Redis, config.Log),
 	}
@@ -279,12 +281,27 @@ func newUseCases(config *BootstrapConfig, cipher *secret.Cipher,
 
 	baseURL := config.Config.GetString("app.base_url")
 
+	seconds := func(key string) time.Duration {
+		return time.Duration(config.Config.GetInt(key)) * time.Second
+	}
+
+	// Both loops are tuned separately because their per-item latency differs by
+	// an order of magnitude: a notification is one HTTP round trip, a mailbox
+	// sync is a connect, a fetch of up to 200 messages and everything the
+	// matcher does with them.
+	tuning := func(concurrencyKey, timeoutKey string) usecase.WorkerTuning {
+		return usecase.WorkerTuning{
+			Concurrency: config.Config.GetInt(concurrencyKey),
+			Timeout:     seconds(timeoutKey),
+		}
+	}
+
 	audit := usecase.NewAuditUseCase(config.DB, config.Log, config.Validate, repos.AuditLogs)
 
 	user := usecase.NewUserUseCase(config.DB, config.Log, config.Validate,
 		repos.Users, repos.Roles, repos.Sessions, audit, userProducer,
 		caches.Users, caches.PasswordReset,
-		time.Duration(config.Config.GetInt("session.ttl"))*time.Second)
+		seconds("session.ttl"), seconds("session.touch_interval"))
 
 	resolver := usecase.NewMailResolver(config.DB, repos.MailProviders, repos.Accounts,
 		registries.Providers, registries.OAuth, cipher, caches.Locks,
@@ -292,11 +309,13 @@ func newUseCases(config *BootstrapConfig, cipher *secret.Cipher,
 
 	pipeline := usecase.NewPipelineUseCase(config.DB, config.Log, repos.Accounts,
 		repos.Watchers, repos.Filters, repos.WatcherEvents, repos.Matches, repos.Runs,
-		repos.SyncRuns, registries.Providers, cipher, resolver)
+		repos.SyncRuns, registries.Providers, cipher, resolver,
+		tuning("worker.poll_concurrency", "worker.poll_timeout"))
 
 	dispatcher := usecase.NewDispatcherUseCase(config.DB, config.Log, repos.Runs,
 		repos.Deliveries, repos.Matches, repos.Watchers, repos.WatcherEvents,
-		registries.Handlers)
+		registries.Handlers,
+		tuning("worker.dispatch_concurrency", "worker.dispatch_timeout"))
 
 	mailAccount := usecase.NewMailAccountUseCase(config.DB, config.Log, config.Validate,
 		repos.Accounts, repos.MailProviders, repos.Watchers, repos.SyncRuns,
@@ -316,7 +335,8 @@ func newUseCases(config *BootstrapConfig, cipher *secret.Cipher,
 
 	activity := usecase.NewActivityUseCase(config.DB, config.Log, config.Validate,
 		repos.Matches, repos.Runs, repos.Deliveries, repos.WatcherEvents,
-		repos.Watchers, repos.Accounts, repos.Notifiers, dispatcher, audit)
+		repos.Watchers, repos.Accounts, repos.Notifiers, dispatcher, audit,
+		caches.Dashboard)
 
 	admin := usecase.NewAdminUseCase(config.DB, config.Log, config.Validate,
 		repos.Users, repos.Roles, repos.Sessions, repos.Watchers, repos.Accounts,
@@ -355,7 +375,8 @@ func setupRoutes(config *BootstrapConfig, useCases useCases,
 		WatcherEventController: http.NewWatcherEventController(
 			useCases.WatcherEvent, config.Log),
 		ActivityController: http.NewActivityController(useCases.Activity, config.Log),
-		CatalogController:  http.NewCatalogController(useCases.Catalog, config.Log),
+		CatalogController: http.NewCatalogController(useCases.Catalog, config.Log,
+			time.Duration(config.Config.GetInt("web.catalog_max_age"))*time.Second),
 		AdminController: http.NewAdminController(useCases.Admin, useCases.Activity,
 			useCases.Audit, useCases.Watcher, useCases.MailAccount,
 			useCases.Notifier, config.Log),
